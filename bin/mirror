@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Copy this board's framework files onto another checkout of it.
+
+  bin/mirror ~/path/to/other-board            # bring it in line with this one
+  bin/mirror ~/path/to/other-board --check    # report drift, change nothing
+  bin/mirror ~/path/to/other-board --prune    # also remove files this board dropped
+
+Two copies of the board - one to develop in, one that actually runs the loop -
+have to stay identical in everything except their own work. What is copied is
+every tracked file; what is never copied is the board's content:
+
+    projects/  inbox/  archive/  NOTIFY.md  STOP  config.json  .mcp.json  .runtime/
+
+It is one-directional, and that is the danger it has to guard against: a change
+made in the destination and never brought back would simply be reverted. So before
+overwriting anything it asks whether the destination's copy is a version this board
+has ever held. A copy that is merely behind is safe to update; a copy holding
+something else stops the sync with a message.
+
+Three things this does that copying by hand gets wrong. It preserves symlinks
+rather than dereferencing them, so `CLAUDE.md -> AGENTS.md` stays a link instead
+of quietly becoming a second copy of the rules. It refuses to write into a board
+whose loop is running, because the agent in that loop calls `bin/task`, which
+imports `lib/tasklib.py`, and swapping it mid-run takes away its ability to close
+its own task. And it refuses to overwrite uncommitted work in the destination,
+which is otherwise unrecoverable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import tasklib as tl  # noqa: E402
+
+# What belongs to each copy and is never mirrored: the board's own work, and its
+# settings. config.json is local on purpose - one board may run two tasks at once
+# while the other runs one, or point at a different agent. Framework defaults live
+# in lib/tasklib.py, so a new setting reaches both copies without copying the file.
+#
+# .mcp.json is local for the same reason: it names servers reachable from this
+# machine, at addresses only this copy can call. Mirroring it would hand a fresh
+# board a server it cannot reach, and pruning it would take the running board's
+# bridge away.
+#
+# LOCAL.md is this copy's own rules. AGENTS.md is mirrored, so anything written
+# there is a rule for every board made from this one; a mode granted for a week
+# or a standing instruction for the copy that runs the loop is not. Written into
+# AGENTS.md such a rule diverges the checkouts by construction and is reverted
+# the next time this runs - which has already happened here once.
+CONTENT = ("projects/", "inbox/", "archive/", "NOTIFY.md", "STOP", "config.json",
+           ".mcp.json", "LOCAL.md")
+
+
+def tracked_files(root: Path) -> list[str]:
+    result = subprocess.run(["git", "-C", str(root), "ls-files"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"error: {root} is not a git checkout, so there is nothing to mirror from")
+    return [line for line in result.stdout.splitlines()
+            if line and not line.startswith(CONTENT)]
+
+
+def loop_is_running(root: Path) -> str | None:
+    """Any run in flight in that board - there may be several, one per resource."""
+    live = []
+    for path in sorted((root / ".runtime" / "workers").glob("*.json")):
+        worker = tl.read_json(path, {}) or {}
+        pid = int(worker.get("pid") or 0)
+        if not pid:
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            import errno
+            if exc.errno != errno.EPERM:
+                continue
+        live.append(f"pid {pid} on {worker.get('task_id', '?')}")
+    return ", ".join(live) if live else None
+
+
+def dirty_files(root: Path, paths: list[str]) -> list[str]:
+    """Destination files with uncommitted changes - overwriting them loses work."""
+    result = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--", *paths],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    dirty = []
+    for line in result.stdout.splitlines():
+        state, _, path = line.partition(" ")
+        path = path.strip().strip('"')
+        if path and not state.startswith("?"):
+            dirty.append(path)
+    return dirty
+
+
+def content_hash(path: Path) -> str | None:
+    """Identity of a file as mirrored: a symlink is its target, not its contents."""
+    if path.is_symlink():
+        return "link:" + os.readlink(path)
+    if not path.exists():
+        return None
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_versions(name: str) -> set[str]:
+    """Every version of this file this board has ever held, by content."""
+    log = subprocess.run(["git", "-C", str(tl.ROOT), "log", "--format=%H", "--", name],
+                         capture_output=True, text=True)
+    versions = set()
+    for commit in log.stdout.split():
+        blob = subprocess.run(["git", "-C", str(tl.ROOT), "show", f"{commit}:{name}"],
+                              capture_output=True)
+        if blob.returncode == 0:
+            versions.add("sha256:" + hashlib.sha256(blob.stdout).hexdigest())
+            versions.add("link:" + blob.stdout.decode("utf-8", "replace").strip())
+    return versions
+
+
+def diverged(destination: Path, names: list[str]) -> list[str]:
+    """Destination files holding something this board has never had.
+
+    A copy that is merely *behind* holds a version from this board's own history,
+    and updating it loses nothing. A copy holding something else is work that was
+    done over there and never came back - mirroring would silently revert it,
+    which is exactly what happened to this board's own web renderer once.
+    """
+    unknown = []
+    for name in names:
+        current = content_hash(destination / name)
+        if current is None:
+            continue                      # not there yet: nothing to lose
+        if current not in source_versions(name):
+            unknown.append(name)
+    return unknown
+
+
+def differs(source: Path, destination: Path) -> bool:
+    if source.is_symlink() or destination.is_symlink():
+        if not (source.is_symlink() and destination.is_symlink()):
+            return True
+        return os.readlink(source) != os.readlink(destination)
+    if not destination.exists():
+        return True
+    return source.read_bytes() != destination.read_bytes()
+
+
+def install(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink() or destination.exists():
+        destination.unlink()
+    if source.is_symlink():
+        destination.symlink_to(os.readlink(source))   # the link, not what it points at
+    else:
+        shutil.copy2(source, destination)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="mirror", description=__doc__.split("\n")[0])
+    parser.add_argument("destination", help="the other board's directory")
+    parser.add_argument("--check", action="store_true", help="report drift, change nothing")
+    parser.add_argument("--prune", action="store_true",
+                        help="also remove framework files this board no longer has")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite destination files that changed since the last sync")
+    args = parser.parse_args()
+
+    destination = Path(args.destination).expanduser().resolve()
+    if destination == tl.ROOT:
+        sys.exit("error: that is this board")
+    if not (destination / "bin" / "task").exists():
+        sys.exit(f"error: {destination} does not look like a board (no bin/task)")
+
+    files = tracked_files(tl.ROOT)
+    changed = [f for f in files if differs(tl.ROOT / f, destination / f)]
+    stale = [f for f in tracked_files(destination) if not (tl.ROOT / f).exists()]
+
+    unknown = diverged(destination, changed)
+
+    if args.check:
+        for name in changed:
+            if name in unknown:
+                print(f"  DIVERGED {name}  (holds something this board never had)")
+            else:
+                print(f"  differs  {name}  (behind this board)")
+        for name in stale:
+            print(f"  stale    {name}")
+        if not changed and not stale:
+            print(f"in sync: {len(files)} framework files")
+            return 0
+        print(f"\n{len(changed)} file(s) differ, {len(stale)} stale; "
+              f"run without --check to mirror")
+        return 1
+
+    if not changed and not (stale and args.prune):
+        print(f"in sync: {len(files)} framework files")
+        return 0
+
+    for root, label in ((tl.ROOT, "this board"), (destination, "the destination")):
+        holder = loop_is_running(root)
+        if holder:
+            sys.exit(f"error: the loop is running in {label} ({holder}).\n"
+                     f"       Its agent calls bin/task, which imports lib/tasklib.py;\n"
+                     f"       replacing that mid-run takes away its ability to close its\n"
+                     f"       own task. Wait for the tick to finish, or stop the loop.")
+
+    # Mirroring something uncommitted puts a version in the destination that this
+    # board's history cannot account for, which is precisely what makes the next
+    # sync unable to tell "behind" from "diverged".
+    own = dirty_files(tl.ROOT, changed)
+    if own:
+        sys.exit("error: these files are not committed here yet:\n"
+                 + "\n".join(f"       {name}" for name in own)
+                 + "\n       Commit them first: a mirrored copy has to be a version this"
+                   "\n       board can point at afterwards.")
+
+    dirty = dirty_files(destination, changed)
+    if dirty:
+        sys.exit("error: the destination has uncommitted changes to files this would "
+                 "overwrite:\n" + "\n".join(f"       {name}" for name in dirty) +
+                 "\n       Commit or discard them first.")
+
+    if unknown and not args.force:
+        lines = ["error: the destination holds versions of these files that this board",
+                 "       has never had, so mirroring would revert work done over there:"]
+        for name in unknown:
+            lines.append(f"       {name}")
+        lines.append("")
+        lines.append("       Bring those changes into this board first, then mirror.")
+        lines.append("       --force discards them, which is almost never what you want.")
+        sys.exit("\n".join(lines))
+
+    for name in changed:
+        install(tl.ROOT / name, destination / name)
+        arrow = f" -> {os.readlink(tl.ROOT / name)}" if (tl.ROOT / name).is_symlink() else ""
+        print(f"  synced   {name}{arrow}")
+    if args.prune:
+        for name in stale:
+            (destination / name).unlink(missing_ok=True)
+            print(f"  removed  {name}")
+    elif stale:
+        print(f"\n{len(stale)} file(s) exist there but not here; --prune removes them:")
+        for name in stale:
+            print(f"  stale    {name}")
+
+
+    print(f"\nmirrored {len(changed)} file(s) into {destination}")
+    print("Review and commit them there; this does not commit for you.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,49 @@
+{
+  "agent": "claude",
+  "agents": {
+    "claude": {
+      "command": [
+        "claude",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "stream-json",
+        "--verbose"
+      ],
+      "prompt": "flag:-p",
+      "workdir_flag": "--add-dir",
+      "stream": "claude-json"
+    },
+    "opencode": {
+      "command": [
+        "opencode",
+        "run"
+      ],
+      "prompt": "arg",
+      "workdir_flag": null,
+      "stream": "text"
+    }
+  },
+  "tick_interval_sec": 600,
+  "stall_timeout_sec": 600,
+  "stall_strikes": 2,
+  "max_wall_sec": 7200,
+  "max_concurrent_tasks": 1,
+  "heartbeat_flush_sec": 30,
+  "sigterm_grace_sec": 30,
+  "groom_interval_sec": 3600,
+  "archive_after_days": 30,
+  "default_max_attempts": 3,
+  "task_log_kept": 8,
+  "task_attempts_kept": 5,
+  "project_brief_chars": 1400,
+  "retry_backoff_sec": 600,
+  "retry_backoff_max_sec": 21600,
+  "max_new_tasks_per_tick": 5,
+  "max_subtask_depth": 3,
+  "notify_desktop": true,
+  "notify_file": true,
+  "git_autocommit": true,
+  "usage_limit_backoff_sec": 3600,
+  "infra_max_refunds": 3
+}

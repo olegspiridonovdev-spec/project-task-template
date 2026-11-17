@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Check an action against the board's hard limits, from any harness.
+
+  bin/guard check "rm -rf projects"         # exit 1 and a reason if it is denied
+  bin/guard check --tool Write --input '{"file_path": "..."}'
+  bin/guard check --tool write --input -    # the JSON on stdin, for large inputs
+  bin/guard hook                            # Claude Code PreToolUse, JSON on stdin
+  bin/guard rules                           # what is enforced, and why
+
+Claude Code wires this through `.claude/hooks/guard.py`. An agent whose harness
+has a pre-execution hook should call `bin/guard check` from it and refuse the
+action on a non-zero exit. An agent whose harness has no hook at all still has
+to follow the rules - `AGENTS.md` says so - and can use this to check itself.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import guardlib as gl  # noqa: E402
+
+
+def cmd_check(args) -> int:
+    if args.input:
+        # `--input -` reads the JSON from stdin. A tool input can be a whole
+        # file's contents, which is larger than an argument list is allowed to
+        # be; a hook that had to truncate it would be checking something other
+        # than what the agent is about to run.
+        raw = sys.stdin.read() if args.input == "-" else args.input
+        try:
+            tool_input = json.loads(raw)
+        except json.JSONDecodeError:
+            sys.exit("error: --input must be JSON")
+    else:
+        command = args.command or sys.stdin.read()
+        tool_input = {"command": command.strip()}
+    subject = gl.subject_for(args.tool, tool_input, args.cwd or os.getcwd())
+    rule = gl.check(args.tool, subject)
+    if rule is None:
+        if not args.quiet:
+            print("allowed")
+        return 0
+    gl.record(rule, args.tool, subject)
+    print(f"[{rule['name']}] {rule['reason']}", file=sys.stderr)
+    return 1
+
+
+def cmd_hook(args) -> int:
+    """Claude Code PreToolUse: a payload on stdin, a decision on stdout."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    tool_name = payload.get("tool_name", "")
+    subject = gl.subject_for(tool_name, payload.get("tool_input", {}) or {},
+                             str(payload.get("cwd") or ""))
+    rule = gl.check(tool_name, subject)
+    if rule is None:
+        return 0
+    gl.record(rule, tool_name, subject)
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": f"[{rule['name']}] {rule['reason']}",
+        }
+    }))
+    return 0
+
+
+def cmd_rules(args) -> int:
+    rules = gl.load_rules()
+    if args.json:
+        print(json.dumps(rules, indent=2))
+        return 0
+    for rule in rules:
+        tools = ", ".join(rule.get("tools", ["*"]))
+        print(f"{rule['name']}  [{tools}]\n  {rule['reason']}\n")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="guard", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="is this action allowed?")
+    check.add_argument("command", nargs="?", help="the shell command; omit to read stdin")
+    check.add_argument("--tool", default="Bash", help="tool name the rules match against")
+    check.add_argument("--input", help="tool input as JSON, for non-shell tools; "
+                                       "`-` reads it from stdin")
+    check.add_argument("--cwd", help="working directory of the call (default: this one)")
+    check.add_argument("--quiet", action="store_true", help="say nothing when allowed")
+    check.set_defaults(func=cmd_check)
+
+    hook = sub.add_parser("hook", help="Claude Code PreToolUse adapter")
+    hook.set_defaults(func=cmd_hook)
+
+    rules = sub.add_parser("rules", help="list what is enforced")
+    rules.add_argument("--json", action="store_true")
+    rules.set_defaults(func=cmd_rules)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Put a board inside a repository, or bring one already there up to date.
+
+  bin/install --into ~/code/myapp        # vendor a board into that repository
+  bin/install --into . --check           # what would change, change nothing
+  .tasks/bin/install --upgrade           # refresh the framework, keep the work
+
+`install.sh` and `install.ps1` are two lines of bootstrap each: they find a copy
+of the board and hand it to this. Everything that decides what an install *is*
+happens here, once, so that the Windows path and the Unix path cannot drift into
+two different products.
+
+What an install leaves behind:
+
+    <repo>/.tasks/          the board - framework, config, tasks, journal
+    <repo>/.tasks/.gitignore  its own runtime state, so the repository stays clean
+    <repo>/.claude/settings.json  the hard limits, in front of every tool call
+    <repo>/AGENTS.md        a pointer, appended, so an agent finds the board
+
+Nothing outside `.tasks/` is ever replaced. The two files in the repository that
+this touches are edited in place and only ever added to, between markers it can
+find again - a repository's own AGENTS.md is the human's file, and an installer
+that overwrote it would be the last thing anyone let near their repository.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+BOARD_DIR = ".tasks"
+
+# Replaced on every install and every upgrade. This is the board itself: code,
+# rules, prompts, the scheduler templates and the per-harness guard adapters.
+FRAMEWORK = [
+    "bin", "lib", "prompts", "scheduler", "tests",
+    ".claude/deny.json", ".claude/hooks", ".claude/settings.json",
+    ".opencode/plugin",
+    "AGENTS.md", "CLAUDE.md", "README.md", "opencode.json",
+    # A vendored board carries the installer it was installed by, so that it can
+    # be pointed at the next repository without going back to where it came
+    # from - and so that the test suite it ships with can still run.
+    "install.sh", "install.ps1",
+]
+
+# Written when they are not there and never touched again. `config.json` is the
+# board's settings and belongs to the copy that has them; a `.gitignore` a
+# person has added a line to is theirs.
+SEED = ["config.json", ".gitignore"]
+
+# Never copied in either direction, whatever an upgrade finds in the source.
+# This is the board's *work*, and an installer that carried a task file from one
+# repository into another would be the worst bug this program could have.
+WORK = {"projects", "inbox", "archive", "tasks", "artifacts", "project.md",
+        "journal.md", "NOTIFY.md", "LOCAL.md", "STOP", ".runtime", "board.html"}
+
+GITIGNORE = """\
+# The board's runtime state: locks, leases, heartbeats and run logs. None of it
+# means anything on another machine and all of it is rebuilt on demand.
+.runtime/
+
+# The search index is derived from the task files and rebuilt from them by
+# `bin/task index --rebuild`. Covered by `.runtime/` above; named anyway,
+# because a committed index would be a second, wrong copy of the board.
+.runtime/index.db
+.runtime/index.db-wal
+.runtime/index.db-shm
+
+# The rendered web board and the manual brake, both local to one machine.
+board.html
+STOP
+
+__pycache__/
+*.pyc
+"""
+
+MARK_BEGIN = "<!-- project-tasks:begin -->"
+MARK_END = "<!-- project-tasks:end -->"
+
+POINTER = """\
+## Tasks
+
+This repository carries its own task board in `.tasks/`. It is how work here is
+queued, worked and recorded, and it is the first place to look before starting
+anything.
+
+```sh
+.tasks/bin/task list --status ready     # what is available
+.tasks/bin/task show <id>               # one task in full
+.tasks/bin/task search "<words>"        # has this been done before?
+.tasks/bin/task journal                 # what earlier tasks decided
+```
+
+`.tasks/AGENTS.md` holds the rules for working a task -- how to reach a terminal
+state, what must be escalated to a human, and what is never allowed. Read it
+before working one. Task files are committed with the code, so a task and the
+change it produced are in the same history.
+"""
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+class Result:
+    """What the install did, so that `--check` and a real run share one path."""
+
+    def __init__(self, check: bool, base: Path | None = None):
+        self.check = check
+        self.base = base
+        self.lines: list[str] = []
+
+    def note(self, verb: str, what: object) -> None:
+        text = str(what)
+        if self.base is not None:
+            # Relative to the repository being installed into. An absolute path
+            # repeated down twenty lines is a column of noise with the answer at
+            # the end of it.
+            try:
+                text = str(Path(text).relative_to(self.base))
+            except ValueError:
+                pass
+        self.lines.append(f"  {verb:<9} {text}")
+
+    def report(self) -> None:
+        for line in self.lines:
+            print(line)
+
+
+def same(source: Path, target: Path) -> bool:
+    """Are these two identical, byte for byte and file for file?
+
+    Asked before every copy so that an install reports what actually differs.
+    Without it `--check` says "update" about every framework directory whether
+    or not anything in it changed, which makes it useless for the one question
+    it exists to answer: is this board behind the one I am installing from.
+    """
+    if source.is_dir() != target.is_dir():
+        return False
+    if source.is_file():
+        return (source.stat().st_size == target.stat().st_size
+                and source.read_bytes() == target.read_bytes())
+    ignored = shutil.ignore_patterns("__pycache__", "*.pyc", "node_modules", ".DS_Store")
+
+    def listing(root: Path) -> dict[str, Path]:
+        found = {}
+        for path in root.rglob("*"):
+            rel = path.relative_to(root)
+            if any(part in ("__pycache__", "node_modules") for part in rel.parts):
+                continue
+            if path.suffix == ".pyc" or path.name == ".DS_Store":
+                continue
+            if path.is_file():
+                found[str(rel)] = path
+        return found
+
+    del ignored
+    left, right = listing(source), listing(target)
+    if left.keys() != right.keys():
+        return False
+    return all(left[key].read_bytes() == right[key].read_bytes() for key in left)
+
+
+def copy(source: Path, target: Path, result: Result, verb: str = "update") -> None:
+    existed = target.exists()
+    if existed and same(source, target):
+        return
+    result.note(verb if existed else "add", str(target))
+    if result.check:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        if existed:
+            shutil.rmtree(target)
+        shutil.copytree(source, target,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc",
+                                                      "node_modules", ".DS_Store"))
+    else:
+        shutil.copy2(source, target)
+
+
+def make_executable(board: Path) -> None:
+    """The entry points, after a copy that may have come out of a tarball.
+
+    A zip carries no permission bits at all and some tar extractions drop them,
+    which turns `.tasks/bin/task` into a file the shell refuses to run with an
+    error that says nothing about why.
+    """
+    for path in (board / "bin").glob("*"):
+        if path.is_file() and path.suffix != ".cmd":
+            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    hook = board / ".claude" / "hooks" / "guard.py"
+    if hook.exists():
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def repo_root(start: Path) -> Path:
+    """The git repository containing `start`, or `start` itself when there is none.
+
+    Installing into a directory that is not a repository yet is allowed - people
+    do set a project up before `git init` - but it is worth saying, because a
+    board that cannot commit is a board with no undo.
+    """
+    import subprocess
+    result = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True)
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve()
+    return start.resolve()
+
+
+# --------------------------------------------------------------------------
+# the repository around the board
+# --------------------------------------------------------------------------
+
+def wire_agent_rules(repo: Path, result: Result) -> None:
+    """Tell an agent opening this repository that there is a board in it.
+
+    Appended between markers, never written over the top: a repository's
+    AGENTS.md is the human's file and usually the most carefully written thing
+    in it. A second install finds its own markers and replaces what is between
+    them, so the pointer stays current without ever growing a second copy.
+    """
+    block = f"{MARK_BEGIN}\n{POINTER}{MARK_END}\n"
+
+    agents = repo / "AGENTS.md"
+    if agents.exists():
+        text = agents.read_text(encoding="utf-8")
+        if MARK_BEGIN in text and MARK_END in text:
+            head, _, rest = text.partition(MARK_BEGIN)
+            _, _, tail = rest.partition(MARK_END)
+            new = head + block + tail.lstrip("\n")
+            if new != text:
+                result.note("refresh", agents)
+        else:
+            new = text.rstrip("\n") + "\n\n" + block
+            result.note("append", agents)
+    else:
+        new = f"# {repo.name}\n\n{block}"
+        result.note("add", agents)
+    if not result.check and new != (agents.read_text(encoding="utf-8")
+                                    if agents.exists() else None):
+        agents.write_text(new, encoding="utf-8")
+
+    # CLAUDE.md is the same rules under the filename Claude Code looks for. A
+    # file that already imports AGENTS.md needs nothing: the pointer is in the
+    # file it imports, and adding a second copy here is how a repository ends up
+    # telling an agent the same thing twice in two places that then drift. Only
+    # a CLAUDE.md that is somebody's separate rules gets its own block.
+    claude = repo / "CLAUDE.md"
+    if not claude.exists():
+        result.note("add", claude)
+        if not result.check:
+            claude.write_text(f"# {repo.name}\n\n@AGENTS.md\n", encoding="utf-8")
+        return
+    text = claude.read_text(encoding="utf-8")
+    if "@AGENTS.md" in text:
+        return
+    if MARK_BEGIN in text and MARK_END in text:
+        head, _, rest = text.partition(MARK_BEGIN)
+        _, _, tail = rest.partition(MARK_END)
+        updated = head + block + tail.lstrip("\n")
+        if updated == text:
+            return
+        result.note("refresh", claude)
+    else:
+        updated = text.rstrip("\n") + "\n\n" + block
+        result.note("append", claude)
+    if not result.check:
+        claude.write_text(updated, encoding="utf-8")
+
+
+HOOK_COMMAND = f'"$CLAUDE_PROJECT_DIR/{BOARD_DIR}/.claude/hooks/guard.py"'
+
+
+def wire_claude_hook(repo: Path, result: Result) -> None:
+    """Put the hard limits in front of every tool call in this repository.
+
+    Claude Code reads `.claude/settings.json` from the directory it was started
+    in, which for an embedded board is the repository and not the board. The
+    board ships its own copy of the same registration for the standalone case;
+    this is the embedded one, merged into whatever the repository already has
+    rather than written over it.
+    """
+    path = repo / ".claude" / "settings.json"
+    settings = {}
+    if path.exists():
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8")) or {}
+        except json.JSONDecodeError:
+            # Refusing is right. Rewriting a settings file we could not parse
+            # would throw away whatever the human had in it.
+            result.note("skip", f"{path.name} (not valid JSON - add the hook by hand)")
+            return
+
+    hooks = settings.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    for entry in pre:
+        for hook in entry.get("hooks", []):
+            if BOARD_DIR in str(hook.get("command", "")):
+                return                       # already wired; nothing to say
+    pre.append({"matcher": "*", "hooks": [
+        {"type": "command", "command": HOOK_COMMAND, "timeout": 10}]})
+    result.note("wire", ".claude/settings.json (PreToolUse guard)")
+    if not result.check:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# the install
+# --------------------------------------------------------------------------
+
+def install(source: Path, repo: Path, result: Result, prune: bool = False) -> Path:
+    board = repo / BOARD_DIR
+
+    missing = [name for name in ("bin", "lib", "AGENTS.md") if not (source / name).exists()]
+    if missing:
+        sys.exit(f"error: {source} does not look like a board "
+                 f"(no {', '.join(missing)})")
+
+    for name in FRAMEWORK:
+        origin = source / name
+        if not origin.exists():
+            continue
+        copy(origin, board / name, result)
+
+    for name in SEED:
+        target = board / name
+        if target.exists():
+            continue
+        if name == ".gitignore":
+            result.note("add", str(target))
+            if not result.check:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(GITIGNORE, encoding="utf-8")
+        elif (source / name).exists():
+            copy(source / name, target, result)
+
+    if prune:
+        for path in sorted(board.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(board)
+            if rel.parts[0] in WORK or rel.name in WORK or rel.name in SEED:
+                continue
+            if not any(str(rel) == n or str(rel).startswith(n + "/") for n in FRAMEWORK):
+                continue
+            if not (source / rel).exists():
+                result.note("remove", str(path))
+                if not result.check:
+                    path.unlink()
+
+    if not result.check:
+        make_executable(board)
+    return board
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="install", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--into", default=".",
+                        help="the repository to install into (default: here)")
+    parser.add_argument("--source",
+                        help="a checkout or unpacked copy of the board to install from")
+    parser.add_argument("--upgrade", action="store_true",
+                        help="refresh the framework of the board this program is part of")
+    parser.add_argument("--check", action="store_true",
+                        help="say what would change and change nothing")
+    parser.add_argument("--prune", action="store_true",
+                        help="also remove framework files the source no longer has")
+    parser.add_argument("--prefix", help="task id prefix (default: from the repository name)")
+    parser.add_argument("--no-wire", action="store_true",
+                        help="do not touch AGENTS.md or .claude/settings.json in the repository")
+    args = parser.parse_args()
+
+    here = Path(__file__).resolve().parent.parent
+    source = Path(args.source).expanduser().resolve() if args.source else here
+    repo = repo_root(Path(args.into).expanduser().resolve())
+
+    if args.upgrade:
+        # Upgrading in place: the board this program is part of, from wherever
+        # the source is. `--into` would be the repository it already sits in.
+        repo = here.parent if here.name == BOARD_DIR else repo
+        if source == here:
+            sys.exit("error: --upgrade needs --source: a board cannot be its own\n"
+                     "       upgrade. Fetch a copy first, or run install.sh again.")
+
+    if source.resolve() == (repo / BOARD_DIR).resolve():
+        sys.exit(f"error: the source and the destination are the same directory")
+
+    result = Result(args.check, base=repo)
+    board = install(source, repo, result, prune=args.prune)
+    if not args.no_wire:
+        wire_agent_rules(repo, result)
+        wire_claude_hook(repo, result)
+
+    verb = "would change" if args.check else "installed"
+    print(f"{verb}: a board in {board}")
+    result.report()
+
+    if args.check:
+        return 1 if result.lines else 0
+
+    # `init` is idempotent and is what makes the board a project: it writes
+    # project.md and the status directories, and leaves an existing one alone.
+    import subprocess
+    init = [sys.executable, str(board / "bin" / "task"), "init"]
+    if args.prefix:
+        init += ["--prefix", args.prefix]
+    subprocess.run(init, check=False)
+
+    if not (repo / ".git").exists():
+        print(f"\nnote: {repo} is not a git repository yet. The board commits its own\n"
+              f"      state after every tick, which is its undo - run `git init` there.")
+    print(f"\nnext:\n"
+          f"  {BOARD_DIR}/bin/task new --title \"...\" --type feature\n"
+          f"  {BOARD_DIR}/bin/task lint            # is it fit to be worked?\n"
+          f"  {BOARD_DIR}/bin/loopctl doctor       # can this machine run the loop?\n"
+          f"  {BOARD_DIR}/README.md                # everything else")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

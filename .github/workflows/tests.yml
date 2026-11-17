@@ -1,0 +1,176 @@
+# What this repository claims about itself, checked on machines that are not the
+# one it was written on.
+#
+# The board says it runs on macOS, Linux and Windows. That was true of the code
+# and untested on two of the three: `lib/portable.py` has a Windows branch
+# nobody had executed, `install.ps1` had never been run at all, and the bug that
+# broke every shebang in a Windows clone was invisible from a Mac. A matrix is
+# the only thing that turns any of that from a claim into a fact.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A second push to the same branch makes the first run's answer irrelevant.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  board:
+    name: ${{ matrix.os }} / python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # one platform failing must not hide the others
+      matrix:
+        # Listed rather than crossed, because on a private repository a macOS
+        # minute is billed at ten and a Windows minute at two. The two Pythons
+        # are there to catch a version-dependent mistake, and one platform
+        # running both is enough to do that; what the other two are for is the
+        # platform, which does not change between 3.11 and 3.13.
+        include:
+          - {os: ubuntu-latest,  python: "3.10"}   # the oldest version supported
+          - {os: ubuntu-latest,  python: "3.11"}
+          - {os: ubuntu-latest,  python: "3.13"}
+          - {os: windows-latest, python: "3.11"}
+          - {os: windows-latest, python: "3.13"}
+          - {os: macos-latest,   python: "3.13"}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The suite clones this checkout to prove a Windows clone still has
+          # runnable entry points, so it needs more than the tip commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Identify the machine
+        run: python -c "import sys,platform;print(sys.version);print(platform.platform())"
+
+      - name: Configure git
+        # The suite makes repositories and commits in them. A runner has no
+        # identity configured, and `git commit` fails without one.
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Run the suite
+        run: python -m unittest discover tests -v
+
+  install:
+    name: install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Make a repository to install into
+        shell: bash
+        run: |
+          mkdir -p ../target/src
+          echo "print('hi')" > ../target/src/app.py
+          printf '# Target\n\nRun the linter.\n' > ../target/AGENTS.md
+          git -C ../target init -q
+          git -C ../target add -A
+          git -C ../target commit -qm "the code"
+
+      - name: Install (POSIX)
+        if: runner.os != 'Windows'
+        run: sh install.sh --into ../target
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # The one path that had never been executed anywhere before this file.
+        run: .\install.ps1 -Into ..\target
+
+      - name: The installed board is a board
+        shell: bash
+        working-directory: ../target
+        run: |
+          # Written to a file rather than inlined: a task body has a blank line
+          # and a `- [ ]` in it, and at column zero inside a YAML block scalar
+          # that ends the block. --body-file is what the flag is for.
+          {
+            echo '## Acceptance criteria'
+            echo
+            echo '- [ ] Requests over the limit get a 429'
+          } > criteria.md
+          .tasks/bin/task new --title "Add rate limiting to the API" \
+            --type feature --body-file criteria.md --ready
+          rm criteria.md
+          .tasks/bin/task lint
+          .tasks/bin/task doctor
+          .tasks/bin/task board
+          grep -q "Run the linter." AGENTS.md    # the repository's own rules survived
+          grep -q ".tasks/bin/task" AGENTS.md    # and the pointer was added
+
+      - name: Installing again changes nothing
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -File ./install.ps1 -Into ../target -Check
+          else
+            sh install.sh --into ../target --check
+          fi
+
+      - name: The board's own suite passes where it was installed
+        shell: bash
+        working-directory: ../target
+        env:
+          # Its own installer test would otherwise install a board and run this
+          # suite again, and again.
+          PROJECT_TASKS_NESTED_SUITE: "1"
+        run: python -m unittest discover .tasks/tests
+
+  lint:
+    name: shell and powershell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        # install.sh is the first thing anybody runs, and it has to work under
+        # dash as well as bash. -s sh checks it as POSIX sh rather than as bash.
+        run: shellcheck -s sh install.sh
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $found = Invoke-ScriptAnalyzer -Path ./install.ps1 -Severity Error,Warning
+          if ($found) { $found | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
+          Write-Host "install.ps1 is clean"
+
+      - name: Nothing outside the standard library
+        # On purpose, and worth a check rather than a promise: a board that
+        # needed `pip install` could not be dropped into somebody's repository
+        # and run. The day one import sneaks in, the install story is gone.
+        run: |
+          if grep -rnE "^[[:space:]]*(import|from) (requests|yaml|click|rich|pydantic|dotenv|httpx)\b" bin lib; then
+            echo "a third-party import would break the install story" >&2
+            exit 1
+          fi
+          echo "stdlib only"

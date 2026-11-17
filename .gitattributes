@@ -1,0 +1,30 @@
+# Line endings, which are not a matter of taste here.
+#
+# Git for Windows installs with core.autocrlf=true, so without this file every
+# text file in a clone made there gets CRLF - and then:
+#
+#   $ ./bin/task doctor
+#   env: python3\r: No such file or directory
+#
+# because the shebang line now ends in a carriage return that `env` reads as
+# part of the interpreter's name. `sh install.sh` fails the same way, one line
+# at a time. The board's Windows support is a `.cmd` shim and a portable
+# library; none of it survives the checkout that delivers it.
+#
+# So: everything is LF in the working tree, whatever the machine's setting says.
+* text=auto eol=lf
+
+# Except the two things Windows itself runs. cmd.exe tolerates LF in a batch
+# file until it does not - a label or a multi-line block can behave differently
+# - and PowerShell here-strings are CRLF-sensitive. These are the files that
+# only ever run on Windows, so they are the files that get Windows' endings.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Derived, and never in a diff worth reading.
+*.db binary
+*.db-wal binary
+*.db-shm binary
+
+# Collapsed in pull request diffs: generated or vendored, not written here.
+.opencode/package-lock.json linguist-generated=true

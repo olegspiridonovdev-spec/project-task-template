@@ -1,0 +1,30 @@
+# Runtime state belongs to the wrapper, not to history — but the directory has to
+# exist on a fresh clone, because launchd writes its logs there before the first tick.
+.runtime/*
+!.runtime/.gitkeep
+
+# The search index is derived from the task files and rebuilt from them by
+# `bin/task index --rebuild`. Covered by `.runtime/*` above; named anyway,
+# because a committed index would be a second, wrong copy of the board.
+.runtime/index.db
+.runtime/index.db-wal
+.runtime/index.db-shm
+
+board.html
+__pycache__/
+*.pyc
+.DS_Store
+STOP
+
+# opencode installs its plugin SDK next to the plugin on first run and writes its
+# own .gitignore for it; named here too so a fresh clone is clean before that
+# first run rather than after it. Only .opencode/plugin/ is the board's.
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/.gitignore
+
+# The product repositories this board drives. Each is its own git repository,
+# named by a project's repo_path; the board tracks the plan, not the code.
+repos/

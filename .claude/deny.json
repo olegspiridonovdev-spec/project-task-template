@@ -1,0 +1,114 @@
+{
+  "_comment": "Hard guardrails enforced by .claude/hooks/guard.py on every tool call. A prompt rule can be forgotten or reasoned around; a PreToolUse hook cannot. Patterns are case-insensitive Python regexes matched against the Bash command, or against the JSON of the tool input for non-Bash tools. Tool names are the ones Claude Code uses; every other harness's names are folded onto them by guardlib.canonical_tool, so a rule is written once and binds every agent. An MCP tool is named differently by each harness, so rules matching one match the server and tool name loosely rather than a single harness's prefix. {{ROOT}} expands to this board's absolute path, so rules stay portable across machines.",
+  "rules": [
+    {
+      "name": "force-push",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "(?:\\A|[\\n;&|(]\\s*)git(?:\\s+-{1,2}[^\\s]+(?:\\s+[^\\s]+)?)*\\s+push\\b[^|;&\\n]*?(--force\\b|--force-with-lease|\\s-f(\\s|$))",
+      "reason": "Force pushing is never allowed. Land the change as a normal commit, or escalate the task with `bin/task need-human`."
+    },
+    {
+      "name": "branch-switching",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "(?:\\A|[\\n;&|(]\\s*)git(?:\\s+-{1,2}[^\\s]+(?:\\s+[^\\s]+)?)*\\s+(?:switch\\b|checkout\\b(?!\\s+--\\s))",
+      "reason": "Changing branches is never allowed. Runs share a working copy: another agent may be in this repository right now, the human may have it open, and the next run inherits whatever branch you leave behind. Do the work on the branch you were given and commit there. `git checkout -- <path>` and `git restore` are fine - they do not move HEAD."
+    },
+    {
+      "name": "destructive-sql",
+      "tools": [
+        "*"
+      ],
+      "pattern": "\\b(drop\\s+(table|database|schema)|truncate\\s+table)\\b",
+      "reason": "Dropping or truncating database objects is never allowed. Escalate with `bin/task need-human`."
+    },
+    {
+      "name": "unscoped-delete",
+      "tools": [
+        "*"
+      ],
+      "pattern": "\\bdelete\\s+from\\s+[\\w.\"`\\[\\]]+(?![^;]{0,400}?\\bwhere\\b)",
+      "reason": "DELETE without a WHERE clause is never allowed. Escalate with `bin/task need-human`."
+    },
+    {
+      "name": "send-email-cli",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "\\b(sendmail|msmtp|mailx|mutt)\\b|\\bmail\\s+-s\\b",
+      "reason": "Sending email is never allowed. Write the draft into the task instead and escalate with `bin/task need-human`."
+    },
+    {
+      "name": "send-email-api",
+      "tools": [
+        "*"
+      ],
+      "pattern": "api\\.sendgrid\\.com|api\\.mailgun\\.net|api\\.postmarkapp\\.com|email\\.[a-z0-9-]+\\.amazonaws\\.com|gmail\\.googleapis\\.com[^\\s\"']*send|messages\\.send",
+      "reason": "Sending email is never allowed. Write the draft into the task instead and escalate with `bin/task need-human`."
+    },
+    {
+      "name": "gmail-tool-send",
+      "tools": [
+        ".*[Gg]mail.*"
+      ],
+      "pattern": "send|draft.*send",
+      "reason": "Sending email is never allowed."
+    },
+    {
+      "name": "paid-resources",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "\\bstripe\\b|aws\\s+(ec2\\s+run-instances|rds\\s+create-|elasticache\\s+create-|redshift\\s+create-)|gcloud\\s+(compute\\s+instances\\s+create|sql\\s+instances\\s+create)|heroku\\s+addons:create|\\bbilling\\b.*\\b(post|put|patch|create|upgrade)\\b|--upgrade-plan",
+      "reason": "Creating paid resources, subscriptions or purchases is never allowed. Deploying to existing infrastructure is fine; provisioning new billable resources is not. Escalate with `bin/task need-human`."
+    },
+    {
+      "name": "catastrophic-rm",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "rm\\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\\s+(/|~|\\$HOME|/\\*)(\\s|$)",
+      "reason": "Recursively deleting a filesystem root or home directory is never allowed."
+    },
+    {
+      "name": "tasks-dir-rewrite",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "rm\\s+-[a-z]*r[a-z]*[^|;&\\n]*({{ROOT}}|{{ROOT_TILDE}}|{{ROOT_NAME}})",
+      "reason": "The task board and its history are not yours to delete. Use `bin/task cancel` instead."
+    },
+    {
+      "name": "board-relative-rm",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "\\Acwd={{ROOT}}[^\\n]*\\n[\\s\\S]*?\\brm\\s+-[a-z]*r[a-z]*\\s+[^|;&\\n]*?(?<=\\s)(?:\\./)?(?:projects|inbox|archive|tasks|\\.runtime|\\.git|\\*|\\.)(?:/\\S*)?(?=\\s|$)",
+      "reason": "The task board and its history are not yours to delete, and the agent's working directory is the board itself - so this names the board even without a path. Use `bin/task cancel` instead."
+    },
+    {
+      "name": "framework-edit",
+      "tools": [
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit"
+      ],
+      "env": "PROJECT_TASKS_RUN",
+      "pattern": "\"file_path\"\\s*:\\s*\"(?:{{ROOT}}|{{ROOT_TILDE}})/(?:(?:bin|lib|prompts|tests|scheduler|\\.claude)/|\\.opencode/plugin/|(?:AGENTS\\.md|LOCAL\\.md|CLAUDE\\.md|README\\.md|config\\.json|\\.mcp\\.json|install\\.sh|install\\.ps1))",
+      "reason": "The board's own framework is not editable from inside a loop run. You are an agent started by bin/tick, and these are the files that start you: changing bin/ or lib/ mid-run takes away your ability to close your own task, and a change made here is reverted the next time the template is mirrored. Land it in the template checkout instead, as a task of its own, and say in your log what you found."
+    },
+    {
+      "name": "framework-write-shell",
+      "tools": [
+        "Bash"
+      ],
+      "env": "PROJECT_TASKS_RUN",
+      "pattern": "\\Acwd=(?:{{ROOT}}|{{ROOT_TILDE}})[^\\n]*\\n[\\s\\S]*?(?:>>?\\s*|\\btee\\s+(?:-a\\s+)?|\\bsed\\s+-i\\b[^|;&\\n]*?\\s|\\bcp\\s+\\S+\\s+|\\bmv\\s+\\S+\\s+)[\"']?(?:(?:{{ROOT}}|{{ROOT_TILDE}})/|\\./)?(?:(?:bin|lib|prompts|tests|scheduler|\\.claude)/|\\.opencode/plugin/|(?:AGENTS\\.md|LOCAL\\.md|CLAUDE\\.md|README\\.md|config\\.json|\\.mcp\\.json|install\\.sh|install\\.ps1))",
+      "reason": "Same boundary as framework-edit, reached through the shell: the board's framework is not writable from inside a loop run. Reading these files and running bin/task is fine; writing them is not."
+    }
+  ]
+}

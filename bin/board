@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""Render the task board as a local web page.
+
+  bin/board                    write board.html and open it once
+  bin/board serve              serve a live board on http://127.0.0.1:7777
+  bin/board serve 8080         ...on another port
+  bin/board serve --refresh 60 ...refreshing every 60s instead of the configured default
+
+The served page refreshes itself in place rather than reloading: it fetches the
+board, swaps the columns, and puts the scroll position back, so a page left open
+on a second monitor stays where you left it. `board_refresh_sec` in config.json
+sets the default interval.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import sys
+import time
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import tasklib as tl  # noqa: E402
+
+# Set by `--refresh N`; otherwise config.json decides.
+REFRESH_OVERRIDE: int | None = None
+
+COLUMNS = tl.BOARD_COLUMNS
+
+CSS = """
+:root {
+  color-scheme: light dark;
+  --bg: #f6f6f4; --panel: #ffffff; --ink: #1a1a19; --muted: #6b6b66;
+  --line: #e2e2dd; --accent: #b8562f; --ok: #2e7d5b; --warn: #b8862f; --err: #b8342f;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16161a; --panel: #1e1e24; --ink: #ececea; --muted: #9a9a94;
+          --line: #2c2c34; --accent: #e0784a; --ok: #4bbd8a; --warn: #d9a83f; --err: #e06a62; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 14px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif; }
+header { padding: 18px 24px; border-bottom: 1px solid var(--line);
+         display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
+h1 { font-size: 16px; margin: 0; letter-spacing: .01em; }
+.meta { color: var(--muted); font-size: 12px; display: flex; gap: 18px; flex-wrap: wrap; }
+.meta b { color: var(--ink); font-weight: 600; }
+.banner { padding: 10px 24px; font-size: 13px; border-bottom: 1px solid var(--line); }
+.banner.stop { background: color-mix(in srgb, var(--err) 18%, var(--panel)); }
+.banner.live { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); }
+main { display: flex; gap: 14px; padding: 18px 24px 40px; overflow-x: auto; align-items: flex-start; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          min-width: 260px; max-width: 300px; flex: 0 0 auto; }
+section > h2 { margin: 0; padding: 11px 14px; font-size: 12px; text-transform: uppercase;
+               letter-spacing: .08em; color: var(--muted); border-bottom: 1px solid var(--line);
+               display: flex; justify-content: space-between; }
+.cards { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 11px; background: var(--bg); }
+.card .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+            color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.card .title { margin-top: 3px; }
+.card .foot { margin-top: 6px; font-size: 11px; color: var(--muted);
+              display: flex; gap: 8px; flex-wrap: wrap; }
+.tag { border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; }
+.p0 { color: var(--err); font-weight: 600; } .p1 { color: var(--warn); font-weight: 600; }
+.blocked { color: var(--warn); }
+.empty { padding: 14px; color: var(--muted); font-size: 12px; }
+footer { padding: 0 24px 30px; color: var(--muted); font-size: 12px; }
+.dim { opacity: .6; }
+body.stale #ago::after { content: " — server unreachable"; color: var(--err); }
+body.stale main { opacity: .5; transition: opacity .3s; }
+.card { cursor: pointer; }
+.card:hover { border-color: var(--accent); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+         color: var(--ink); padding: 0; max-width: 820px; width: calc(100% - 40px);
+         max-height: 84vh; box-shadow: 0 24px 60px rgba(0,0,0,.35); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+#detail-body { padding: 22px 26px 28px; overflow-y: auto; max-height: 84vh; }
+#detail-close { position: absolute; top: 10px; right: 12px; border: 0; background: none;
+                color: var(--muted); font-size: 26px; line-height: 1; cursor: pointer; }
+#detail-close:hover { color: var(--ink); }
+.d-title { font-size: 17px; font-weight: 600; margin: 0 34px 4px 0; }
+.d-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+        color: var(--muted); }
+.d-facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 18px; }
+.d-facts span { border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px;
+                font-size: 11px; color: var(--muted); }
+.d-facts b { color: var(--ink); font-weight: 600; }
+#detail-body h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+                  color: var(--muted); margin: 20px 0 7px; }
+#detail-body h4 { font-size: 13px; margin: 16px 0 6px; }
+#detail-body p { margin: 7px 0; }
+#detail-body ul { margin: 7px 0; padding-left: 20px; }
+#detail-body li { margin: 3px 0; }
+#detail-body li.task::marker { content: ""; }
+#detail-body li.task { list-style: none; margin-left: -20px; }
+#detail-body pre { background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+                   padding: 10px 12px; overflow-x: auto; font-size: 12px; }
+#detail-body code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+                    padding: 0 4px; font-size: 12px;
+                    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#detail-body pre code { border: 0; padding: 0; background: none; }
+.d-log { font-size: 12px; color: var(--muted); }
+.d-log li { margin: 5px 0; }
+.d-err { color: var(--err); }
+"""
+
+
+def is_overdue(task: tl.Task) -> bool:
+    """A due date already past on a task nobody has closed.
+
+    Only worth showing while the task is still open: a `due` in the past on
+    something already done is history, not a warning.
+    """
+    if task.status in tl.CLOSED or not task.due:
+        return False
+    when = tl.parse_ts(task.due)
+    return bool(when and when < datetime.now(timezone.utc))
+
+
+def collect() -> dict:
+    index = {t.id: t for t in tl.iter_tasks()}
+    grouped = {status: [] for status, _ in COLUMNS}
+    for task in index.values():
+        if task.status not in grouped:
+            continue
+        grouped[task.status].append({
+            "id": task.id,
+            "title": task.title,
+            "project": task.project,
+            "priority": task.priority,
+            "attempts": task.attempts,
+            "max_attempts": task.max_attempts,
+            "checkpoint": task.has_checkpoint(),
+            "type": task.type,
+            "size": task.size,
+            "due": task.due,
+            "overdue": is_overdue(task),
+            "tags": task.meta.get("tags") or [],
+            # Only for `ready`: that is where lint is binding, and where a task
+            # that slipped in with --force is worth seeing before the loop picks
+            # it up. Linting every column here would cost a project.md read per
+            # task for a warning nobody acts on yet.
+            "lint": tl.lint_task(task, index) if task.status == "ready" else [],
+            "blocked_by": tl.blocking_reasons(task, index),
+            "updated": str(task.meta.get("updated") or ""),
+        })
+    for status in grouped:
+        grouped[status].sort(key=lambda c: (tl.PRIORITY_ORDER.get(c["priority"], 9), c["id"]))
+        if status == "done":
+            grouped[status] = sorted(grouped[status], key=lambda c: c["updated"], reverse=True)[:8]
+
+    workers = tl.live_workers()
+
+    spend = tl.read_json(tl.RUNTIME / "spend.json", {}) or {}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    return {
+        "grouped": grouped,
+        "workers": workers,
+        "limit": tl.usage_limit_hold(),
+        "stopped": (tl.ROOT / "STOP").exists(),
+        "today": spend.get(today, {"runs": 0, "usd": 0.0}),
+        "generated": tl.utcnow(),
+        "refresh": refresh_seconds(),
+    }
+
+
+def refresh_seconds() -> int:
+    """How often the served page re-reads the board. Clamped to something sane."""
+    if REFRESH_OVERRIDE is not None:
+        seconds = REFRESH_OVERRIDE
+    else:
+        try:
+            seconds = int(tl.load_config().get("board_refresh_sec", 30))
+        except (TypeError, ValueError):
+            seconds = 15
+    return max(5, min(seconds, 3600))
+
+
+# Refreshing in place rather than reloading: a full meta-refresh throws away the
+# scroll position and flashes, which is exactly wrong for a page you leave open.
+LIVE_JS = r"""
+(function () {
+  var every = %INTERVAL% * 1000, last = Date.now();
+  var ago = document.getElementById('ago');
+  function stamp() {
+    if (!ago) return;
+    var s = Math.round((Date.now() - last) / 1000);
+    ago.textContent = s < 2 ? 'just now' : s + 's ago';
+  }
+  setInterval(stamp, 1000);
+  async function refresh() {
+    try {
+      var res = await fetch(location.pathname + '?t=' + Date.now(), { cache: 'no-store' });
+      if (!res.ok) throw new Error(res.status);
+      var doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      var main = document.querySelector('main');
+      var x = main ? main.scrollLeft : 0, y = window.scrollY;
+      document.getElementById('meta').innerHTML = doc.getElementById('meta').innerHTML;
+      document.getElementById('live').innerHTML = doc.getElementById('live').innerHTML;
+      var after = document.querySelector('main');
+      if (after) after.scrollLeft = x;
+      window.scrollTo(0, y);
+      last = Date.now();
+      document.body.classList.remove('stale');
+    } catch (err) {
+      document.body.classList.add('stale');
+    }
+    stamp();
+  }
+  setInterval(refresh, every);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) refresh();
+  });
+
+  // --- task detail -------------------------------------------------------
+  var dialog = document.getElementById('detail');
+  var target = document.getElementById('detail-body');
+
+  function esc(t) {
+    return t.replace(/[&<>]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
+    });
+  }
+
+  // Just enough Markdown for what a task body actually contains. Task bodies wrap
+  // their bullets and paragraphs across lines, so continuation lines have to rejoin
+  // the block they belong to before any inline markup is applied.
+  function markdown(src) {
+    var out = [], list = false, fence = null, para = [], item = null;
+    var lines = esc(src).split('\n');
+
+    function inline(t) {
+      return t.replace(/`([^`]+)`/g, '<code>$1</code>')
+              .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    }
+    function flushItem() {
+      if (!item) return;
+      out.push('<li' + (item.cls ? ' class="' + item.cls + '"' : '') + '>' +
+               item.prefix + inline(item.text.join(' ')) + '</li>');
+      item = null;
+    }
+    function closeList() {
+      flushItem();
+      if (list) { out.push('</ul>'); list = false; }
+    }
+    function flushPara() {
+      if (!para.length) return;
+      out.push('<p>' + inline(para.join(' ')) + '</p>');
+      para = [];
+    }
+    function openItem(cls, prefix, text) {
+      flushPara(); flushItem();
+      if (!list) { out.push('<ul>'); list = true; }
+      item = { cls: cls, prefix: prefix, text: [text] };
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+
+      if (/^\s*```/.test(line)) {
+        if (fence === null) { flushPara(); closeList(); fence = []; }
+        else { out.push('<pre><code>' + fence.join('\n') + '</code></pre>'); fence = null; }
+        continue;
+      }
+      if (fence !== null) { fence.push(line); continue; }
+
+      if (!line.trim()) { flushPara(); closeList(); continue; }
+
+      var heading = line.match(/^(#{2,4})\s+(.*)$/);
+      if (heading) {
+        flushPara(); closeList();
+        var tag = heading[1].length === 2 ? 'h3' : 'h4';
+        out.push('<' + tag + '>' + inline(heading[2]) + '</' + tag + '>');
+        continue;
+      }
+
+      var box = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.*)$/);
+      if (box) {
+        openItem('task', box[1].toLowerCase() === 'x' ? '\u2713 ' : '\u25a1 ', box[2]);
+        continue;
+      }
+      var bullet = line.match(/^\s*[-*]\s+(.*)$/);
+      if (bullet) { openItem('', '', bullet[1]); continue; }
+
+      // A continuation line belongs to whatever block is still open.
+      if (item) { item.text.push(line.trim()); continue; }
+      closeList();
+      para.push(line.trim());
+    }
+
+    if (fence !== null) out.push('<pre><code>' + fence.join('\n') + '</code></pre>');
+    flushPara(); closeList();
+    return out.join('');
+  }
+
+  function facts(d) {
+    var bits = [
+      '<span>project <b>' + esc(d.project) + '</b></span>',
+      '<span>status <b>' + esc(d.status) + '</b></span>',
+      '<span>priority <b>' + esc(d.priority) + '</b></span>',
+      '<span>type <b>' + esc(d.type || '\u2014') + '</b></span>',
+      '<span>attempts <b>' + d.attempts + '/' + d.max_attempts + '</b></span>',
+      '<span>owner <b>' + esc(d.owner) + '</b></span>',
+    ];
+    if (d.size) bits.push('<span>size <b>' + esc(d.size) + '</b></span>');
+    if (d.due) bits.push('<span>due <b>' + esc(d.due) + '</b></span>');
+    if (d.depends_on && d.depends_on.length)
+      bits.push('<span>after <b>' + esc(d.depends_on.join(', ')) + '</b></span>');
+    (d.tags || []).forEach(function (t) { bits.push('<span>' + esc(t) + '</span>'); });
+    if (d.checkpoint_at) bits.push('<span>checkpoint <b>' + esc(d.checkpoint_at) + '</b></span>');
+    if (d.updated) bits.push('<span>updated <b>' + esc(d.updated) + '</b></span>');
+    return '<div class="d-facts">' + bits.join('') + '</div>';
+  }
+
+  async function open(id) {
+    target.innerHTML = '<p class="d-id">' + esc(id) + '</p><p>Loading...</p>';
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    try {
+      var res = await fetch('/task?id=' + encodeURIComponent(id), { cache: 'no-store' });
+      var d = await res.json();
+      if (d.error) throw new Error(d.error);
+      var head = '<p class="d-id">' + esc(d.id) + '</p>' +
+                 '<p class="d-title">' + esc(d.title) + '</p>' + facts(d);
+      if (d.blocked_by && d.blocked_by.length)
+        head += '<p class="d-err">Blocked: ' + esc(d.blocked_by.join('; ')) + '</p>';
+      // What `bin/task lint` would say. Shown for every open task, because the
+      // point of the field is to be read before the task reaches ready.
+      if (d.lint && d.lint.length)
+        head += '<p class="d-err">Not fit to be worked: ' + esc(d.lint.join('; ')) + '</p>';
+      target.innerHTML = head + markdown(d.body) +
+                         '<h3>File</h3><p><code>' + esc(d.path) + '</code></p>';
+    } catch (err) {
+      target.innerHTML = '<p class="d-title">' + esc(id) + '</p>' +
+        '<p class="d-err">Could not load this task: ' + esc(String(err.message || err)) +
+        '</p><p>Task details are served by <code>bin/board serve</code>. ' +
+        'A board opened as a plain file cannot fetch them.</p>';
+    }
+  }
+
+  document.addEventListener('click', function (event) {
+    if (event.target.closest('#detail-close')) { dialog.close(); return; }
+    var card = event.target.closest('.card');
+    if (card && card.dataset.id) open(card.dataset.id);
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    var card = document.activeElement && document.activeElement.closest('.card');
+    if (card && card.dataset.id) { event.preventDefault(); open(card.dataset.id); }
+  });
+  dialog.addEventListener('click', function (event) {
+    if (event.target === dialog) dialog.close();   // click on the backdrop
+  });
+})();
+"""
+
+
+def render(data: dict) -> str:
+    esc = html.escape
+    workers = data["workers"]
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        f"<noscript><meta http-equiv='refresh' content='{data['refresh']}'></noscript>",
+        "<title>Project Tasks</title>",
+        f"<style>{CSS}</style></head><body>",
+        "<header><h1>Project Tasks</h1><div class='meta' id='meta'>",
+        f"<span>runs today <b>{data['today'].get('runs', 0)}</b></span>",
+        f"<span title='Equivalent value of the tokens used. On a Claude subscription "
+        f"this is not money charged - it is a usage gauge.'>usage today "
+        f"<b>${data['today'].get('usd', 0):.2f} eq</b></span>",
+        f"<span>updated <b id='ago'>just now</b></span>",
+        f"<span class='dim'>every {data['refresh']}s</span>",
+        "</div></header>",
+        "<div id='live'>",
+    ]
+
+    if data["stopped"]:
+        parts.append("<div class='banner stop'><b>STOP file present</b> — the loop is paused. "
+                     "Remove <code>STOP</code> to resume.</div>")
+    if data.get("limit"):
+        until = str(data["limit"].get("until_wall", ""))
+        parts.append("<div class='banner stop'><b>Usage limit reached</b> — the loop is "
+                     f"waiting until {esc(until)} before claiming another task. "
+                     "No task was failed and no attempt was burned.</div>")
+    for worker in workers:
+        if not worker.get("task_id"):
+            continue
+        started = worker.get("started_wall", "")
+        parts.append(
+            f"<div class='banner live'>Working on <b>{esc(str(worker['task_id']))}</b> "
+            f"since {esc(str(started))} — pid {esc(str(worker.get('pid', '?')))}, "
+            f"{esc(str(worker.get('events', 0)))} agent events, "
+            f"generation {esc(str(worker.get('generation', '?')))}.</div>")
+    if not workers and not data["stopped"]:
+        parts.append("<div class='banner'>Idle — no run is in flight.</div>")
+
+    parts.append("<main>")
+    for status, label in COLUMNS:
+        cards = data["grouped"].get(status, [])
+        parts.append(f"<section><h2><span>{esc(label)}</span><span>{len(cards)}</span></h2>")
+        if not cards:
+            parts.append("<div class='empty'>empty</div></section>")
+            continue
+        parts.append("<div class='cards'>")
+        for card in cards:
+            priority_class = card["priority"].lower()
+            parts.append(f"<div class='card' data-id='{esc(card['id'])}' "
+                         f"tabindex='0' role='button' "
+                         f"aria-label='Open {esc(card['id'])}'>")
+            parts.append(f"<div class='id'><span>{esc(card['id'])}</span>"
+                         f"<span class='{priority_class}'>{esc(card['priority'])}</span></div>")
+            parts.append(f"<div class='title'>{esc(card['title'])}</div>")
+            foot = [f"<span class='tag'>{esc(card['project'])}</span>"]
+            if card["type"]:
+                foot.append(f"<span class='tag'>{esc(card['type'])}</span>")
+            if card["size"]:
+                foot.append(f"<span class='tag'>{esc(card['size'])}</span>")
+            if card["due"]:
+                due_class = " class='blocked'" if card["overdue"] else ""
+                foot.append(f"<span{due_class}>due {esc(card['due'])}</span>")
+            if card["attempts"]:
+                foot.append(f"<span>try {card['attempts']}/{card['max_attempts']}</span>")
+            if card["checkpoint"]:
+                foot.append("<span>checkpoint</span>")
+            for tag in card["tags"]:
+                foot.append(f"<span class='tag'>{esc(str(tag))}</span>")
+            parts.append(f"<div class='foot'>{''.join(foot)}</div>")
+            if card["blocked_by"]:
+                parts.append("<div class='foot blocked'>" +
+                             esc("; ".join(str(r) for r in card["blocked_by"])) + "</div>")
+            if card["lint"]:
+                parts.append("<div class='foot blocked'>not fit: " +
+                             esc("; ".join(str(r) for r in card["lint"])) + "</div>")
+            parts.append("</div>")
+        parts.append("</div></section>")
+    parts.append("</main></div>")
+    parts.append(
+        "<dialog id='detail'>"
+        "<button id='detail-close' aria-label='Close'>&times;</button>"
+        "<div id='detail-body'></div>"
+        "</dialog>")
+    parts.append(f"<script>{LIVE_JS.replace('%INTERVAL%', str(data['refresh']))}</script>")
+    parts.append("<footer>Source of truth is the filesystem. "
+                 "This page is generated from the task files on every request.</footer>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def task_detail(task_id: str) -> dict | None:
+    task = tl.find_task(task_id)
+    if task is None:
+        return None
+    return {
+        "id": task.id,
+        "title": task.title,
+        "project": task.project,
+        "status": task.status,
+        "priority": task.priority,
+        "type": task.type,
+        "size": task.size,
+        "due": task.due,
+        "overdue": is_overdue(task),
+        "attempts": task.attempts,
+        "max_attempts": task.max_attempts,
+        "owner": str(task.meta.get("owner", "agent")),
+        "lint": [str(r) for r in tl.lint_task(task)],
+        "depends_on": task.depends_on,
+        "tags": [str(t) for t in (task.meta.get("tags") or [])],
+        "updated": str(task.meta.get("updated") or ""),
+        "created": str(task.meta.get("created") or ""),
+        "checkpoint_at": str(task.meta.get("checkpoint_at") or ""),
+        "path": str(task.path.relative_to(tl.ROOT)),
+        "blocked_by": [str(r) for r in tl.blocking_reasons(task)],
+        "body": task.body,
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path.rstrip("/") == "/task":
+            wanted = parse_qs(parsed.query).get("id", [""])[0]
+            detail = task_detail(wanted) if wanted else None
+            payload = json.dumps(detail or {"error": f"no task with id {wanted}"})
+            body = payload.encode("utf-8")
+            self.send_response(200 if detail else 404)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = render(collect()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silence per-request logging
+        pass
+
+
+def main() -> int:
+    global REFRESH_OVERRIDE
+    args = sys.argv[1:]
+    if "--refresh" in args:
+        index = args.index("--refresh")
+        try:
+            REFRESH_OVERRIDE = int(args[index + 1])
+        except (IndexError, ValueError):
+            sys.exit("error: --refresh needs a number of seconds")
+        del args[index:index + 2]
+    if args and args[0] == "serve":
+        ports = [a for a in args[1:] if a.isdigit()]
+        port = int(ports[0]) if ports else 7777
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        url = f"http://127.0.0.1:{port}/"
+        print(f"serving the board on {url}, refreshing every {refresh_seconds()}s "
+              f"(ctrl-c to stop)")
+        webbrowser.open(url)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return 0
+
+    output = tl.ROOT / "board.html"
+    output.write_text(render(collect()), encoding="utf-8")
+    print(f"wrote {output}")
+    if "--no-open" not in args:
+        webbrowser.open(output.as_uri())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

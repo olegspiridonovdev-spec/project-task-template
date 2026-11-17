@@ -1,0 +1,29 @@
+# Template. `bin/loopctl install` renders it into
+# ~/.config/systemd/user/<label>.service with this machine's paths filled in.
+# Do not edit the rendered copy - edit this file and reinstall.
+#
+# This is the half that does the work. The timer beside it decides when.
+
+[Unit]
+Description=Project Tasks board loop ({{ROOT}})
+# The loop reads task files and runs an agent that talks to the network; there
+# is nothing to do before the machine has a filesystem and a route out.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ROOT}}
+ExecStart={{PYTHON}} {{ROOT}}/bin/tick
+Environment=PATH={{PATH}}
+Environment=HOME={{HOME}}
+
+# systemd would otherwise kill a tick at the default timeout and leave the task
+# it was working in-progress with nobody behind it. The wrapper enforces its own
+# ceilings -- max_wall_sec per attempt, max_tick_wall_sec per tick -- and those
+# are the ones that know how to settle a task on the way out.
+TimeoutStartSec=infinity
+
+# Below everything the human is doing. The loop is never the urgent thing on
+# the machine.
+Nice=10
+IOSchedulingClass=idle

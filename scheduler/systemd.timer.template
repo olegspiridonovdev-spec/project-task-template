@@ -1,0 +1,23 @@
+# Template. `bin/loopctl install` renders it into
+# ~/.config/systemd/user/<label>.timer with this machine's paths filled in.
+# Do not edit the rendered copy - edit this file and reinstall.
+
+[Unit]
+Description=Fire the Project Tasks board loop every {{INTERVAL}}s ({{ROOT}})
+
+[Timer]
+# Measured from the end of the last run, not from a wall-clock grid: a tick that
+# took forty minutes should be followed by an interval of quiet, not by the four
+# firings it slept through arriving at once. This is what makes the timer behave
+# the way launchd's StartInterval does, which is the behaviour the loop is
+# written against -- systemd will not start a second run while one is going.
+OnUnitInactiveSec={{INTERVAL}}
+# The first firing after boot or after `loopctl install`.
+OnActiveSec=60
+AccuracySec=30
+# Catch up once after the machine was asleep or off, rather than never.
+Persistent=true
+Unit={{LABEL}}.service
+
+[Install]
+WantedBy=timers.target

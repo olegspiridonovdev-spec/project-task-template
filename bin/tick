@@ -1,0 +1,1239 @@
+#!/usr/bin/env python3
+"""One iteration of the autonomous task loop.
+
+Ownership model
+---------------
+The lock is held by this wrapper, never by the agent. The agent is an
+unreliable participant: it can forget to close a task, wander off, or crash
+halfway. This process is not - it has a `finally` block, and the kernel
+releases its `flock` on exit, including SIGKILL and reboot.
+
+That gives the system its central invariant:
+
+    A task is in-progress if and only if a live holder owns the lock.
+    After this wrapper exits, no task is left in-progress.
+
+Three independent signals answer three different questions:
+
+    ownership   is a slot taken?          flock on .runtime/worker.lock
+    liveness    does the process exist?   the kernel, via that same flock
+    progress    is it actually working?   the agent's stream-json stdout
+
+The third one matters most: every tool call and token the agent emits is a
+line on stdout. The agent cannot forget to produce them, so silence is real
+evidence of a stall rather than something we have to trust it to report.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import portable  # noqa: E402
+import tasklib as tl  # noqa: E402
+
+WORKERS_DIR = tl.RUNTIME / "workers"
+SLOTS_DIR = tl.RUNTIME / "slots"
+LOCKS_DIR = tl.RUNTIME / "locks"
+STRIKES_FILE = tl.RUNTIME / "strikes.json"
+GENERATION_FILE = tl.RUNTIME / "generation"
+LAST_GROOM_FILE = tl.RUNTIME / "last_groom"
+SPEND_FILE = tl.RUNTIME / "spend.json"
+LIMIT_FILE = tl.RUNTIME / "usage_limit.json"
+STOP_FILE = tl.ROOT / "STOP"
+RUNS_DIR = tl.RUNTIME / "runs"
+
+# Stopping the loop is something the human did, not something the task did.
+STOP_REASON = "STOP file present"
+
+# How often the run loop stops reading lines and asks its own questions: is
+# there a STOP file, has the agent gone quiet, has the run outlived its ceiling.
+# A second is far below every timeout it guards and costs nothing next to what
+# the agent is doing.
+CHECK_INTERVAL_SEC = 1.0
+
+# A reset time parsed out of a message is trusted only this far ahead. It is a
+# sanity bound on someone else's number rather than something to tune.
+MAX_TRUSTED_RESET_SEC = 24 * 3600
+
+CONFIG = tl.load_config()
+
+
+def say(message: str) -> None:
+    print(f"[{tl.utcnow()}] {message}", flush=True)
+
+
+read_json = tl.read_json
+write_json = tl.write_json
+
+
+class FileLock:
+    """A flock held for as long as this process lives, and no longer.
+
+    Ownership is the kernel's to track, not ours: whatever ends the process -
+    a clean exit, SIGKILL, a panic, the machine going down - releases the lock.
+    That is what lets the next tick tell "someone is working on this" from
+    "someone died holding this" without a heartbeat or a timeout.
+    """
+
+    def __init__(self, path: Path, label: str = ""):
+        self.path = path
+        self.label = label or path.stem
+        self.handle = None
+
+    def acquire(self) -> bool:
+        handle = portable.open_lock_file(self.path)
+        if not portable.lock_exclusive(handle):
+            handle.close()
+            return False
+        # Written after the lock is taken, never before: the text is a courtesy
+        # for whoever reads the file, and the lock is the fact.
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()} {self.label}\n")
+        handle.flush()
+        self.handle = handle
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            portable.unlock(self.handle)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+SIBLING_ENV = "CLAUDE_TASKS_TICK_SIBLING"
+
+# Set on every agent this wrapper starts, and on nothing else. It is what lets a
+# rule in .claude/deny.json bind a loop run without binding the human editing the
+# same files by hand: the board's framework must be unwritable from inside a run
+# and freely editable in the checkout where that work belongs, and those are the
+# same paths. See guardlib.rule_applies.
+RUN_ENV = "PROJECT_TASKS_RUN"
+
+
+def start_siblings() -> int:
+    """Start one tick per slot this one cannot fill itself.
+
+    Everything the siblings touch is already built for several ticks at once:
+    slots bound the concurrency, resource locks keep two runs off one working
+    copy, the generation counter is taken under a lock and the board's commits
+    are serialised. What was missing is a launcher. launchd refuses to run a
+    second instance of the same job while the first is alive, so however many
+    slots the config allowed, one long task left the whole board idle - even
+    with a free slot and ready work in a different repository.
+
+    A sibling never starts siblings of its own, so the fan-out is one level deep
+    and bounded by max_concurrent_tasks. A sibling that finds every slot taken
+    says so and exits, which costs nothing.
+    """
+    if os.environ.get(SIBLING_ENV):
+        return 0
+    slots = max(1, int(CONFIG["max_concurrent_tasks"]))
+    if slots < 2:
+        return 0
+    env = dict(os.environ)
+    env[SIBLING_ENV] = "1"
+    started = 0
+    for _ in range(slots - 1):
+        try:
+            subprocess.Popen(
+                [sys.executable, str(tl.ROOT / "bin" / "tick")],
+                cwd=str(tl.ROOT), env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            started += 1
+        except OSError as exc:
+            say(f"could not start a sibling tick: {exc}")
+            break
+    if started:
+        say(f"started {started} sibling tick(s) for the other {slots - 1} slot(s)")
+    return started
+
+
+def acquire_slot() -> FileLock | None:
+    """One of the run slots, or None when every slot is taken.
+
+    The slots are what bounds concurrency; the resource locks are what keeps two
+    runs off the same working copy. Both are needed: without slots a board with
+    ten projects would start ten agents at once.
+    """
+    slots = max(1, int(CONFIG["max_concurrent_tasks"]))
+    for index in range(1, slots + 1):
+        lock = FileLock(SLOTS_DIR / f"{index}.lock", f"slot {index}/{slots}")
+        if lock.acquire():
+            return lock
+    return None
+
+
+# --------------------------------------------------------------------------
+# infra outcomes: failures that say nothing about the task
+# --------------------------------------------------------------------------
+#
+# The wrapper cannot tell "this task is broken" from "this machine could not
+# work right now", and the attempts counter only makes sense for the first. So
+# the second gets a class of its own: an infra outcome refunds the attempt,
+# requeues the task and records why, and the counter is left alone.
+#
+# The plan's usage limit was the first cause handled this way and is now simply
+# the first consumer. Adding the next cause is a row in INFRA_CAUSES, not a new
+# branch in settle_task - which is what this file turning into a pile of special
+# cases looks like when it starts.
+#
+# Detection reads *structured* evidence only: the CLI's own stderr and the final
+# `result` event when that event reports an error. It must never read the
+# agent's transcript, because the transcript echoes back every file the agent
+# read - including this file, the board's README, NOTIFY.md and the very log
+# line this handler writes. Matching on that text makes the handler trigger on
+# its own output: one real limit would teach the loop to pause forever.
+#
+# Two things bound the damage when a pattern is nonetheless wrong. Every note
+# this module writes is worded so that it does not match any pattern here (there
+# is a test for exactly that), and the refund cap applies to the class as a
+# whole, so a misdetection cannot remove a task's attempt ceiling.
+LIMIT_PATTERNS = [
+    r"usage limit reached",
+    r"rate[_ ]limit_?error",
+    r"limit will reset",
+    r"exceeded your (?:usage|rate) limit",
+    r"you have exceeded your.{0,40}limit",
+    r"upgrade to increase your usage limit",
+    r"insufficient (?:credits|quota)",
+    # The CLI reworded this in 2026: "You've hit your session limit - resets
+    # 1:10pm (America/New_York)". Nothing in the older list matched it, so a
+    # whole window of limited runs was recorded as task failures and seventeen
+    # healthy tasks were parked in needs-human with their attempts spent.
+    r"hit your (?:session|usage|rate|weekly) limit",
+    r"(?:session|weekly) limit reached",
+]
+LIMIT_RE = re.compile("|".join(LIMIT_PATTERNS), re.I)
+# Some messages carry the reset moment as a unix timestamp, e.g.
+# "Claude AI usage limit reached|1756130400".
+RESET_RE = re.compile(r"limit reached\D{0,12}(\d{9,13})", re.I)
+
+
+class InfraOutcome(NamedTuple):
+    """A run that failed for a reason the task had nothing to do with.
+
+    `hold_until` is where the wait lives, and an outcome installs exactly one.
+    A cause that names its own end - the plan limit, which reports a reset -
+    holds the whole loop until then, because the machine is out of action for
+    every project, not just this one. A cause that does not name an end holds
+    only the task, on the ordinary retry backoff, so the loop can keep working
+    other projects while it clears.
+
+    Writing both for the limit is a bug rather than belt and braces: the
+    loop-wide hold is what `bin/loopctl start` clears, and a `ready_after` on
+    the task would outlive it and make that escape hatch not escape.
+    """
+    cause: str                      # short slug: one per category, used in logs
+    note: str                       # what the human reads; never matches a pattern above
+    hold_until: float | None = None
+
+
+# One row per category of "the machine could not work right now". Wording is
+# taken from what the tools themselves emit, not from how a person would
+# describe the problem, because only the first kind reaches stderr.
+INFRA_CAUSES = [
+    ("network", "the machine could not reach the outside world", [
+        r"\bgetaddrinfo\b",
+        r"\bEAI_AGAIN\b",
+        r"temporary failure in name resolution",
+        r"could not resolve host",
+        r"\bENOTFOUND\b",
+        r"\bECONNREFUSED\b",
+        r"\bECONNRESET\b",
+        r"\bENETDOWN\b",
+        r"\bENETUNREACH\b",
+        r"\bEHOSTUNREACH\b",
+        r"connection refused",
+        r"network is (?:down|unreachable)",
+        r"no route to host",
+    ]),
+    ("credentials", "the agent's sign-in is absent or was refused", [
+        r"\bauthentication_error\b",
+        r"\binvalid_api_key\b",
+        r"invalid api key",
+        r"\bunauthorized\b",
+        r"\b401\b.{0,40}\bunauthoriz",
+        r"oauth token (?:has )?expired",
+        r"(?:token|session|credentials?) (?:has |have )?expired",
+        r"not logged in",
+        r"(?:please |)run [`'\"]?\S*\s?login",
+        r"no (?:api key|credentials) (?:found|configured)",
+    ]),
+    ("disk", "the volume the board runs on has no room left", [
+        r"\bENOSPC\b",
+        r"no space left on device",
+        r"disk quota exceeded",
+    ]),
+]
+INFRA_RES = [(cause, note, re.compile("|".join(patterns), re.I))
+             for cause, note, patterns in INFRA_CAUSES]
+
+
+def infra_evidence(evidence: dict) -> str:
+    """The only text an infra outcome may be inferred from.
+
+    stderr belongs to the CLI itself. The final `result` event is included only
+    when it reports a failure - on a successful run its `result` field holds the
+    agent's own closing message, which is transcript, not evidence.
+    """
+    parts = [str(evidence.get("stderr") or "")]
+    result = evidence.get("result")
+    if isinstance(result, dict):
+        failed = (bool(result.get("is_error"))
+                  or str(result.get("subtype") or "success") != "success")
+        if failed:
+            for key in ("subtype", "error", "result", "message"):
+                value = result.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+                elif isinstance(value, (dict, list)):
+                    parts.append(json.dumps(value, ensure_ascii=False))
+    return "\n".join(part for part in parts if part)
+
+
+def trusted_reset(stamp: object) -> float | None:
+    """A reset moment we are willing to sleep until, or None.
+
+    Trusted only when it points at a plausible near future: a bad parse must
+    not be able to put the loop to sleep for weeks.
+    """
+    try:
+        value = int(stamp)
+    except (TypeError, ValueError):
+        return None
+    if value > 10_000_000_000:          # milliseconds
+        value //= 1000
+    if time.time() < value < time.time() + MAX_TRUSTED_RESET_SEC:
+        return float(value)
+    return None
+
+
+def structured_limit(evidence: dict) -> tuple[bool, float | None]:
+    """Read the limit off structured fields rather than off wording.
+
+    Prose drifts. The CLI reworded this message to "You've hit your session
+    limit - resets 1:10pm", which no pattern in LIMIT_PATTERNS matched, and the
+    reword cost seventeen healthy tasks their attempts before anyone noticed. A
+    429 and a `rate_limit_event` do not drift, and neither can be echoed back by
+    an agent reading a file: both are fields the wrapper reads by name rather
+    than text it matches.
+    """
+    hit, until = False, None
+    limit = evidence.get("rate_limit")
+    if isinstance(limit, dict):
+        info = limit.get("rate_limit_info")
+        info = info if isinstance(info, dict) else limit
+        if str(info.get("status") or "") == "rejected":
+            hit = True
+            until = trusted_reset(info.get("resetsAt"))
+    result = evidence.get("result")
+    if isinstance(result, dict):
+        try:
+            status = int(result.get("api_error_status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status == 429:
+            hit = True
+    return hit, until
+
+
+def detect_usage_limit(evidence: dict, code: int | None = None) -> float | None:
+    """Return the epoch to wait until, or None if this is not a usage limit."""
+    if code is not None and code == 0:
+        return None                     # a run that succeeded did not hit a limit
+    hit, until = structured_limit(evidence)
+    if until:
+        return until
+    text = infra_evidence(evidence)
+    if not hit and (not text or not LIMIT_RE.search(text)):
+        return None
+    match = RESET_RE.search(text) if text else None
+    if match:
+        stamp = trusted_reset(match.group(1))
+        if stamp:
+            return stamp
+    return time.time() + CONFIG["usage_limit_backoff_sec"]
+
+
+def detect_infra(evidence: dict, code: int | None = None,
+                 repo_path: str | None = None) -> InfraOutcome | None:
+    """Classify a finished run as infra, or None if the task itself is suspect.
+
+    Order matters only in that the plan limit is asked first: it is the one
+    cause that can name when it will be over, and answering "network" to a
+    message that also says the limit reset at 11:00 would throw that away.
+    """
+    if code is not None and code == 0:
+        return None                     # a run that succeeded hit nothing
+
+    until = detect_usage_limit(evidence, code)
+    if until:
+        return InfraOutcome("usage limit", "plan limit hit", until)
+
+    # The one cause with better evidence than text: the wrapper knows where the
+    # project's working copy is meant to be, so it can look. This is what an
+    # unmounted volume or a moved checkout looks like from here, and no amount
+    # of retrying inside the agent would have helped.
+    resolved = tl.resolve_repo(repo_path)
+    if resolved is not None and not resolved.is_dir():
+        # Plain existence, not `tl.repo_state`: that also answers False for a
+        # directory that is there but is not a git checkout, and "the human
+        # mistyped repo_path" is a board problem the human must see, not
+        # something to keep refunding attempts over.
+        return InfraOutcome("workspace",
+                            f"the project's working copy is not there ({repo_path})")
+
+    text = infra_evidence(evidence)
+    if text:
+        for cause, note, regex in INFRA_RES:
+            if regex.search(text):
+                return InfraOutcome(cause, note)
+    return None
+
+
+def usage_limit_active() -> float | None:
+    hold = tl.usage_limit_hold()
+    if hold:
+        return float(hold["until"])
+    LIMIT_FILE.unlink(missing_ok=True)   # expired, or never there
+    return None
+
+
+def record_usage_limit(until: float, task_id: str | None) -> None:
+    already = usage_limit_active()
+    write_json(LIMIT_FILE, {
+        "until": until,
+        "until_wall": datetime.fromtimestamp(until, timezone.utc)
+                              .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "detected_wall": tl.utcnow(),
+        "task_id": task_id,
+    })
+    local = datetime.fromtimestamp(until).strftime("%H:%M")
+    say(f"plan limit hit; the loop waits until {local}")
+    if not already:   # notify once per limit window, not on every tick
+        # Deliberately worded so it does not match LIMIT_PATTERNS: this line
+        # lands in NOTIFY.md, which the grooming agent reads out loud.
+        tl.notify("Loop paused",
+                  f"Plan limit; waiting until {local}. No task failed, no attempt burned.",
+                  "warn")
+
+
+def process_alive(pid: int) -> bool:
+    return portable.process_alive(pid)
+
+
+# --------------------------------------------------------------------------
+# phase 1 - watchdog: runs even when another tick owns the lock
+# --------------------------------------------------------------------------
+
+def watchdog_all() -> None:
+    """Check every run in flight, including our own siblings.
+
+    With several runs at once there is no single "the worker": each holds its own
+    file under .runtime/workers/. A file whose process is gone is stale and its
+    task will be reclaimed as an orphan on this same tick.
+    """
+    for path in sorted(WORKERS_DIR.glob("*.json")):
+        worker = read_json(path, {}) or {}
+        pid = int(worker.get("pid") or 0)
+        if not pid or not process_alive(pid):
+            path.unlink(missing_ok=True)
+            continue
+        watchdog(worker)
+
+
+def watchdog(worker: dict) -> None:
+    """Backstop for a wrapper that is alive but no longer making progress.
+
+    The running wrapper enforces the stall and wall-clock limits on itself;
+    this only fires when that self-enforcement failed, which means the wrapper
+    itself is wedged.
+    """
+    pid = int(worker.get("pid") or 0)
+    task_id = worker.get("task_id") or "?"
+
+    if not process_alive(pid):
+        # flock was held a moment ago but the process is gone: the next tick
+        # will acquire the lock cleanly and repair the task as an orphan.
+        say(f"holder pid {pid} is gone; next tick will reclaim {task_id}")
+        return
+
+    strikes = read_json(STRIKES_FILE, {}) or {}
+    generation = str(worker.get("generation"))
+    same_boot = worker.get("boot_id") == tl.boot_id()
+
+    # Monotonic clocks on macOS do not advance while the machine is asleep,
+    # so this age is naturally sleep-corrected.
+    age = None
+    if same_boot and worker.get("last_event_mono") is not None:
+        age = time.monotonic() - float(worker["last_event_mono"])
+
+    started = tl.parse_ts(worker.get("started_wall"))
+    wall = (datetime.now(timezone.utc) - started).total_seconds() if started else 0
+
+    if age is not None and age > CONFIG["stall_timeout_sec"]:
+        count = int(strikes.get(generation, 0)) + 1
+        # Merged, not replaced: another run's strikes are none of our business.
+        write_json(STRIKES_FILE, {**strikes, generation: count})
+        say(f"no agent events for {int(age)}s on {task_id} (strike {count}/"
+            f"{CONFIG['stall_strikes']})")
+        if count >= CONFIG["stall_strikes"]:
+            say(f"killing wedged holder pid {pid}")
+            kill_process(pid)
+            tl.notify("Watchdog kill", f"{task_id}: no agent events for {int(age)}s", "error")
+        return
+
+    if wall > CONFIG["max_wall_sec"]:
+        say(f"{task_id} exceeded max wall time ({int(wall)}s); killing pid {pid}")
+        kill_process(pid)
+        tl.notify("Watchdog kill", f"{task_id}: exceeded max wall time", "error")
+        return
+
+    if strikes.get(generation):
+        write_json(STRIKES_FILE, {k: v for k, v in strikes.items() if k != generation})
+    say(f"holder pid {pid} is working on {task_id} "
+        f"({worker.get('events', 0)} events, last {int(age) if age is not None else '?'}s ago)")
+
+
+def kill_process(pid: int, process: subprocess.Popen | None = None) -> None:
+    """SIGTERM, then SIGKILL after the grace period.
+
+    When the caller owns the process it passes it, and liveness is asked with
+    `poll()` rather than with signal 0. That is not a refinement: an exited
+    child stays a zombie until its parent reaps it, and a zombie answers signal
+    0 exactly as a running process does. Asking the wrong way meant every kill
+    of an agent we started sat out the whole `sigterm_grace_sec` and then sent
+    a SIGKILL to a process that had been dead for thirty seconds.
+    """
+    alive = (lambda _pid: process.poll() is None) if process is not None else process_alive
+    portable.kill_gracefully(pid, CONFIG["sigterm_grace_sec"], alive)
+
+
+# --------------------------------------------------------------------------
+# phase 2 - repair the invariant
+# --------------------------------------------------------------------------
+
+def resource_lock(key: str) -> FileLock:
+    return FileLock(tl.lock_path(key), key)
+
+
+def reclaim_orphans() -> int:
+    """A task is in-progress legitimately only while someone holds its resource.
+
+    With one global lock this was "we hold it, so nobody is working". Per
+    resource it is the same test, asked once per task: if the lock is free, the
+    holder is gone, whatever else is running elsewhere on the board.
+    """
+    reclaimed = 0
+    for task in tl.iter_tasks(status="in-progress"):
+        lock = resource_lock(tl.resource_key(task))
+        if not lock.acquire():
+            continue                    # a live holder owns it: normal work in flight
+        try:
+            fresh = tl.find_task(task.id)
+            if fresh is None or fresh.status != "in-progress":
+                continue                # it closed while we were looking
+            task = fresh
+            generation = task.meta.get("lease_generation", "?")
+            task.log(f"orphaned: {tl.resource_key(task)} free while in-progress "
+                     f"(generation {generation})", "tick")
+            if task.attempts >= task.max_attempts:
+                task.move("needs-human",
+                          f"orphaned after {task.attempts}/{task.max_attempts} attempts",
+                          actor="tick")
+                tl.notify(f"{task.id} needs you", "Orphaned and out of attempts", "action")
+            else:
+                task.move("ready", "reclaimed after holder disappeared", actor="tick")
+            reclaimed += 1
+        finally:
+            lock.release()
+    if reclaimed:
+        say(f"reclaimed {reclaimed} orphaned task(s)")
+    return reclaimed
+
+
+# --------------------------------------------------------------------------
+# phase 3 - run the agent
+# --------------------------------------------------------------------------
+
+class Holder:
+    """Owns worker.json for the duration of one agent run."""
+
+    def __init__(self, generation: int, task_id: str):
+        self.generation = generation
+        self.task_id = task_id
+        self.path = WORKERS_DIR / f"{generation}.json"
+        self.events = 0
+        self.started_wall = tl.utcnow()
+        self.started_mono = time.monotonic()
+        self.last_event_mono = self.started_mono
+        self.last_flush = 0.0
+
+    def snapshot(self) -> dict:
+        return {
+            "generation": self.generation,
+            "pid": os.getpid(),
+            "task_id": self.task_id,
+            "boot_id": tl.boot_id(),
+            "started_wall": self.started_wall,
+            "last_event_wall": tl.utcnow(),
+            "last_event_mono": self.last_event_mono,
+            "events": self.events,
+            "phase": "running",
+        }
+
+    def start(self) -> None:
+        write_json(self.path, self.snapshot())
+
+    def finish(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+    def flush(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self.last_flush >= CONFIG["heartbeat_flush_sec"]:
+            write_json(self.path, self.snapshot())
+            self.last_flush = now
+
+    def beat(self) -> None:
+        self.events += 1
+        self.last_event_mono = time.monotonic()
+
+
+def next_generation() -> int:
+    """Read, add one, write - under a lock, or two ticks get the same number."""
+    with portable.open_lock_file(GENERATION_FILE) as handle:
+        portable.lock_exclusive(handle, blocking=True)
+        try:
+            handle.seek(0)
+            try:
+                current = int(handle.read().strip() or 0)
+            except ValueError:
+                current = 0
+            current += 1
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(current))
+            handle.flush()
+            return current
+        finally:
+            portable.unlock(handle)
+
+
+def build_prompt(template_path: Path, values: dict) -> str:
+    text = template_path.read_text(encoding="utf-8")
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", str(value))
+    return text
+
+
+def attempt_line(task) -> str:
+    left = max(0, task.max_attempts - task.attempts)
+    if task.attempts <= 1:
+        return f"{task.attempts} of {task.max_attempts} - first attempt"
+    return (f"{task.attempts} of {task.max_attempts} - "
+            + (f"{left} left after this one" if left
+               else "the last one; failing again parks the task in needs-human"))
+
+
+def wall_budget_line() -> str:
+    wall = int(CONFIG["max_wall_sec"])
+    stall = int(CONFIG["stall_timeout_sec"]) * int(CONFIG["stall_strikes"])
+    return (f"{wall // 60} min of wall clock for this run, and the watchdog kills it "
+            f"after {stall // 60} min with no output at all")
+
+
+def failure_brief(task) -> str:
+    """What earlier attempts tried and what broke, newest first."""
+    found = tl.split_section(task.body, "## Attempts")
+    lines = [l.rstrip() for l in found[1].splitlines() if l.strip().startswith("- ")] if found else []
+    if lines:
+        return "\n".join(lines)
+    last = str(task.meta.get("last_error") or "").strip()
+    return f"- {last}" if last else "(none - nothing has failed on this task yet)"
+
+
+def record_spend(payload: dict) -> None:
+    with FileLock(tl.RUNTIME / "spend.lock", "spend") as lock:
+        if not lock.acquire():
+            time.sleep(0.2)          # another run is writing; one retry is enough
+            if not lock.acquire():
+                return
+        _record_spend(payload)
+
+
+def _record_spend(payload: dict) -> None:
+    cost = payload.get("total_cost_usd")
+    if cost is None:
+        return
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    spend = read_json(SPEND_FILE, {})
+    entry = spend.setdefault(day, {"runs": 0, "usd": 0.0})
+    entry["runs"] += 1
+    entry["usd"] = round(entry["usd"] + float(cost), 4)
+    for old in [k for k in spend if k < day][:-30]:
+        spend.pop(old, None)
+    write_json(SPEND_FILE, spend)
+
+
+def spend_today() -> float:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return float(read_json(SPEND_FILE, {}).get(day, {}).get("usd", 0.0))
+
+
+def next_utc_day() -> float:
+    """When the day's spending starts again, as a timestamp.
+
+    The ceiling is a day's, so it lifts itself; nothing has to remember to clear
+    it and a restart cannot lose it. `spend.json` is keyed by UTC day, so this is
+    the same boundary the accounting already uses.
+    """
+    now = datetime.now(timezone.utc)
+    tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return tomorrow.timestamp()
+
+
+def spend_ceiling_reached() -> tuple[bool, float, float]:
+    """Whether today's spending has reached the configured ceiling.
+
+    Checked before a run is started and never during one: a ceiling that killed
+    a run in flight would burn the attempt it just paid for, and leave the task
+    to be started again from nothing tomorrow.
+    """
+    ceiling = float(CONFIG.get("daily_spend_limit_usd") or 0)
+    if ceiling <= 0:
+        return False, 0.0, ceiling
+    spent = spend_today()
+    return spent >= ceiling, spent, ceiling
+
+
+def run_agent(prompt: str, holder: Holder, extra_dirs: list[str],
+              log_path: Path) -> tuple[int, str | None, dict]:
+    """Run the agent, treating its stdout stream as the heartbeat.
+
+    Returns (exit code, reason we terminated it early or None, evidence), where
+    evidence carries the CLI's stderr and its final `result` event - the only
+    parts of a run that are the CLI speaking rather than the agent.
+    """
+    profile = tl.agent_profile(CONFIG)
+    command, stdin_text = tl.agent_command(profile, prompt, extra_dirs)
+    json_stream = profile.get("stream") == "claude-json"
+
+    env = dict(os.environ)
+    env[RUN_ENV] = str(holder.generation)
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(tl.ROOT),
+        env=env,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if stdin_text is not None:
+        process.stdin.write(stdin_text)
+        process.stdin.close()
+    say(f"agent started: {profile['name']} (pid {process.pid})")
+
+    reason = None
+    stderr_tail: list[str] = []
+    result_payload: dict | None = None
+    rate_limit_payload: dict | None = None
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    reader = portable.StreamReader(process)
+    last_check = time.monotonic()
+    with log_path.open("w", encoding="utf-8") as log:
+        # A thread per pipe rather than select(), which refuses a pipe on
+        # Windows. The reader yields None when it has been idle, but idleness is
+        # not what schedules the checks below: an agent narrating steadily never
+        # goes idle, and STOP and the wall clock have to be answered for a busy
+        # run as much as for a quiet one. So the checks run on their own clock,
+        # and the idle tick only guarantees the loop wakes up to look.
+        for item in reader.lines(poll_sec=1.0):
+            if item is not None:
+                stream, line = item
+                log.write(line)
+                # Any line on either stream is progress. Which stream an agent
+                # narrates on is its own business - Claude Code writes events to
+                # stdout, opencode writes its progress to stderr - and treating
+                # only one of them as a heartbeat reports a working agent as a
+                # stalled one.
+                holder.beat()
+                if stream == "stdout":
+                    if json_stream:
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            payload = None
+                        if isinstance(payload, dict) and payload.get("type") == "result":
+                            record_spend(payload)
+                            result_payload = payload
+                        elif (isinstance(payload, dict)
+                              and payload.get("type") == "rate_limit_event"):
+                            rate_limit_payload = payload
+                else:
+                    stderr_tail.append(line)
+                    if len(stderr_tail) > 200:
+                        del stderr_tail[:100]
+                if time.monotonic() - last_check < CHECK_INTERVAL_SEC:
+                    continue
+
+            last_check = time.monotonic()
+            log.flush()
+            holder.flush()
+
+            if STOP_FILE.exists():
+                reason = STOP_REASON
+            elif time.monotonic() - holder.last_event_mono > CONFIG["stall_timeout_sec"]:
+                reason = (f"no agent events for "
+                          f"{int(time.monotonic() - holder.last_event_mono)}s")
+            elif time.monotonic() - holder.started_mono > CONFIG["max_wall_sec"]:
+                reason = f"exceeded max wall time ({CONFIG['max_wall_sec']}s)"
+
+            if reason:
+                say(f"terminating agent: {reason}")
+                kill_process(process.pid, process)
+                break
+
+    code = process.wait()
+    reader.drain()
+    holder.flush(force=True)
+    say(f"agent exited with code {code} after {holder.events} events")
+    evidence = {"stderr": "".join(stderr_tail)[-8000:], "result": result_payload,
+                "rate_limit": rate_limit_payload}
+    return code, reason, evidence
+
+
+def settle_task(task_id: str, generation: int, code: int, reason: str | None,
+                infra: InfraOutcome | None = None) -> None:
+    """Guarantee the task does not stay in-progress. Runs even on failure."""
+    task = tl.find_task(task_id)
+    if task is None:
+        say(f"warning: task {task_id} disappeared")
+        return
+    lease = str(task.meta.get("lease_generation", ""))
+    if lease and lease != str(generation):
+        # We were reclaimed while running and someone else has since claimed it.
+        # The lease is on the task itself, so this holds however many runs exist.
+        say(f"fencing: generation {generation} superseded by {lease}; "
+            f"not touching {task_id}")
+        return
+    if task.status != "in-progress":
+        say(f"{task_id} finished as {task.status}")
+        return
+
+    if reason == STOP_REASON:
+        # The human pressed the brake. The task did nothing wrong, so it keeps its
+        # attempt and is not held back - it should be first in line on resume.
+        task.meta["attempts"] = max(0, task.attempts - 1)
+        task.save()
+        note = "stopped by the human; attempt refunded"
+        say(f"{task_id}: {note}")
+        task.log(note, "tick")
+        task.move("ready", note, actor="tick")
+        return
+
+    if infra:
+        refunds = int(task.meta.get("refunds", 0) or 0)
+        # One cap for the whole class, not one per cause: what it bounds is how
+        # long a task may go on not spending attempts, and the task cannot tell
+        # which detector was wrong about it. Per-cause caps would let three
+        # causes take turns and the ceiling would never arrive.
+        cap = int(CONFIG["infra_max_refunds"])
+        if refunds < cap:
+            # Give the attempt back: this outcome says nothing about the task.
+            # The cap matters - if detection is ever wrong, an unbounded refund
+            # removes the attempt ceiling and the task retries forever.
+            task.meta["attempts"] = max(0, task.attempts - 1)
+            task.meta["refunds"] = refunds + 1
+            task.meta["last_error"] = f"infra ({infra.cause}): {infra.note}"[:200]
+            task.save()
+            note = f"{infra.note}; attempt refunded and task requeued"
+            say(f"{task_id}: {note}")
+            # The refund means no attempt was spent, so the line reads 0/3 - but
+            # the next run still needs to know the last one died on the machine
+            # rather than on the work.
+            task.note_attempt(f"infra: {infra.cause}", infra.note)
+            task.log(note, "tick")
+            task.move("ready", note, actor="tick")
+            if infra.hold_until is None:
+                # The backoff is computed from `attempts`, which the refund just
+                # put back - so a run of infra outcomes keeps the first delay
+                # instead of escalating into hours. That is the point: a network
+                # blip is not evidence that waiting longer will help, and the
+                # refund cap, not the delay, is what bounds the repetition.
+                delay = tl.schedule_retry(task, config=CONFIG)
+                say(f"{task_id}: next attempt held back for {delay // 60} min (backoff)")
+            return
+        say(f"{task_id}: {infra.cause} outcome but {refunds} attempts were already "
+            f"refunded; treating this as a normal requeue")
+        task.log(f"{infra.note}; refund cap of {cap} reached, attempt kept", "tick")
+
+    if reason:
+        note = f"terminated by wrapper: {reason}"
+    elif code != 0:
+        note = f"agent exited with code {code} without a terminal transition"
+    else:
+        note = "agent exited without a terminal transition"
+
+    say(f"{task_id}: {note}")
+    task.meta["last_error"] = note[:200]
+    task.save()
+    # One bounded line per attempt, so the next run reads what broke without
+    # reading the whole log to find it.
+    if reason:
+        task.note_attempt("interrupted", reason)
+    else:
+        task.note_attempt("no terminal state",
+                          f"agent exited with code {code}" if code else "agent exited cleanly")
+    task.log(note, "tick")
+    if task.attempts >= task.max_attempts:
+        task.move("needs-human", f"{note}; attempts exhausted", actor="tick")
+        tl.notify(f"{task_id} needs you", note, "action")
+    else:
+        task.move("ready", note, actor="tick")
+        delay = tl.schedule_retry(task, config=CONFIG)
+        say(f"{task_id}: next attempt held back for {delay // 60} min (backoff)")
+        if reason:
+            tl.notify(f"{task_id} interrupted", note, "warn")
+
+
+def housekeeping() -> None:
+    """Board upkeep that needs no agent, so it must not wait for an idle board.
+
+    Grooming only runs when nothing is ready; on a busy board that meant the
+    archive was never swept and closed tasks accumulated forever.
+    """
+    moved = tl.archive_closed()
+    if moved:
+        say(f"archived {moved} closed task(s)")
+
+
+def board_fingerprint() -> str:
+    """What the board's task files look like right now, cheaply.
+
+    Size and mtime rather than content: grooming needs to know whether anything
+    could have changed, not what changed, and hashing every task body on a board
+    of several hundred would cost more than the question is worth.
+    """
+    digest = hashlib.sha256()
+    for root in (tl.ROOT / "projects", tl.ROOT / "inbox"):
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.md")):
+            try:
+                stat = path.stat()
+            except OSError:           # deleted between the walk and the stat
+                continue
+            digest.update(f"{path.relative_to(tl.ROOT)}:{stat.st_size}:"
+                          f"{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def read_last_groom() -> tuple[float, dict | None]:
+    """When grooming last ran, and the board it was looking at.
+
+    None for the second value means there is no record of what the last run saw -
+    an older board, or one that has never groomed - and the only safe reading of
+    that is that the board may have changed.
+    """
+    if not LAST_GROOM_FILE.exists():
+        return 0.0, None
+    raw = LAST_GROOM_FILE.read_text(encoding="utf-8").strip()
+    try:                              # the format before this: a bare timestamp
+        return float(raw), None
+    except ValueError:
+        pass
+    try:
+        saved = json.loads(raw)
+        at = float(saved.get("at", 0.0))
+    except (ValueError, AttributeError, TypeError):
+        return 0.0, None
+    if "fingerprint" not in saved or "targets" not in saved:
+        return at, None
+    return at, {"fingerprint": str(saved["fingerprint"]),
+                "targets": list(saved["targets"])}
+
+
+def write_last_groom() -> None:
+    LAST_GROOM_FILE.write_text(
+        json.dumps({"at": time.time(),
+                    "fingerprint": board_fingerprint(),
+                    "targets": groom_targets()}),
+        encoding="utf-8")
+
+
+def groom_targets() -> list[str]:
+    """What grooming could actually change right now.
+
+    Grooming costs a full agent run, and on a drained board it has no input at
+    all: nothing to lint, nothing to promote, nothing whose blocker has cleared.
+    It used to run anyway, once an hour, forever - the board was idle for a day
+    and paid for twenty-four agents to confirm it. So the wrapper asks first, in
+    Python, and stays silent when the answer is nothing.
+
+    Archiving is not on this list on purpose: `housekeeping()` does it without an
+    agent on every tick, so it can never be the reason to spend one.
+    """
+    tasks, index = tl.board_index()
+    targets = []
+    if any(t.status == "ready" for t in tasks):
+        targets.append("ready tasks to lint")
+    promotable = [t for t in tasks
+                  if t.status in ("backlog", "blocked")
+                  and not tl.blocking_reasons(t, index)]
+    if promotable:
+        targets.append(f"{len(promotable)} task(s) that could move to ready")
+    return targets
+
+
+def should_groom() -> tuple[bool, str]:
+    """Whether to spend an agent on grooming, and the reason either way.
+
+    Having a target is not on its own a reason to groom again. A `ready` task
+    whose dependency is still open is a target every hour for as long as the
+    dependency stays open, and grooming it a second time re-reads a board the
+    first run already decided about. So the question is not "is there anything
+    here" but "is there anything here the last run did not already see" - which
+    is the target list and the board's files, together.
+    """
+    last, seen = read_last_groom()
+    if time.time() - last < CONFIG["groom_interval_sec"]:
+        return False, "groomed within the interval"
+    targets = groom_targets()
+    if seen is None:
+        return True, "no record of what the last grooming saw"
+    # A board whose files have moved may hold something no rule above can name -
+    # a duplicate of work closed months ago, a criterion the tasks since have
+    # made describe nothing. Only an agent sees those, so a changed board is a
+    # reason on its own, even with no target.
+    moved = board_fingerprint() != seen["fingerprint"]
+    if targets == seen["targets"] and not moved:
+        return False, "nothing has changed since the last grooming"
+    if targets:
+        return True, "; ".join(targets)
+    return True, "the board changed since the last grooming"
+
+
+def claim_a_task(generation: int) -> tuple[object, FileLock] | tuple[None, None]:
+    """The best eligible task whose resource is free, claimed and locked.
+
+    Walking the list rather than taking only the first is the whole point: a
+    project whose repository is already being worked is skipped, and the tick
+    goes on to the next project instead of standing still.
+    """
+    for candidate in tl.eligible_tasks():
+        key = tl.resource_key(candidate)
+        lock = resource_lock(key)
+        if not lock.acquire():
+            say(f"{candidate.id}: {key} is busy; looking further down the list")
+            continue
+        fresh = tl.find_task(candidate.id)
+        if fresh is None or fresh.status != "ready":
+            lock.release()      # claimed between listing and locking
+            continue
+        subprocess.run([str(tl.ROOT / "bin" / "task"), "claim", candidate.id,
+                        "--generation", str(generation)], check=True)
+        claimed = tl.find_task(candidate.id)
+        if claimed is None:
+            lock.release()
+            continue
+        return claimed, lock
+    return None, None
+
+
+def run_work(generation: int) -> bool:
+    """Claim and work one task. True when something ran, False when idle.
+
+    The return value is what keeps the tick going: main() calls this until it
+    says there was nothing left to do, so finishing a task starts the next one
+    immediately instead of waiting out the launchd interval.
+    """
+    task, lock = claim_a_task(generation)
+
+    if task is None:
+        if tl.eligible_tasks():
+            say("every eligible task needs a resource that is already busy")
+            return False
+        groom, why = should_groom()
+        if not groom:
+            say(f"no ready tasks; nothing to do ({why})")
+            return False
+        say(f"no ready tasks; grooming because {why}")
+        holder = Holder(generation, "groom")
+        holder.start()
+        prompt = build_prompt(tl.ROOT / "prompts" / "groom.md", {
+            "TASKS_ROOT": str(tl.ROOT),
+            "PROJECTS_ROOT": tl.projects_root(),
+            "LOCAL_POLICY": tl.local_policy() or "(none)",
+        })
+        log_path = RUNS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-groom.jsonl"
+        try:
+            code, _, evidence = run_agent(prompt, holder, [], log_path)
+            # Grooming holds no task, so an infra outcome has nothing to refund;
+            # only the loop-wide hold is worth taking from it.
+            infra = detect_infra(evidence, code)
+            if infra and infra.hold_until:
+                record_usage_limit(infra.hold_until, None)
+        finally:
+            write_last_groom()
+            holder.finish()
+        tl.git_commit(f"groom: generation {generation}")
+        return True
+
+    project = tl.project_meta(task.project_dir)
+    repo = tl.resolve_repo(project.get("repo_path") or "")
+    repo_path = str(repo) if repo else ""
+    say(f"claimed {task.id} ({task.title}) holding {tl.resource_key(task)}")
+
+    holder = Holder(generation, task.id)
+    holder.start()
+
+    prompt = build_prompt(tl.ROOT / "prompts" / "tick.md", {
+        "TASK_ID": task.id,
+        "TASK_TITLE": task.title,
+        "TASK_PATH": str(task.path),
+        "PROJECT_NAME": task.project,
+        "PROJECT_DIR": str(task.project_dir),
+        "PROJECT_FILE": str(task.project_dir / "project.md"),
+        "REPO_PATH": repo_path or "(none)",
+        "TASKS_ROOT": str(tl.ROOT),
+        "GENERATION": generation,
+        # Everything below is known here and was previously not told at all: the
+        # agent had to spend tool calls discovering its own situation, and had no
+        # way at all to learn how much wall clock it had left.
+        "ATTEMPT": attempt_line(task),
+        "WALL_BUDGET": wall_budget_line(),
+        "CHECKPOINT": task.checkpoint_text() or "(none - nothing has been checkpointed yet)",
+        "LAST_FAILURE": failure_brief(task),
+        "LOCAL_POLICY": tl.local_policy() or "(none)",
+        "PROJECT_BRIEF": tl.project_brief(task.project_dir) or "(project.md has no body)",
+        # What the tasks before this one decided. The single most expensive thing
+        # an agent can do is re-answer a question this project has already
+        # answered, and it had no way to know one had been.
+        "PROJECT_JOURNAL": tl.project_journal(task.project_dir)
+            or "(nothing recorded yet - this is the first task to leave an entry)",
+    })
+    log_path = RUNS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{task.id}.jsonl"
+
+    code, reason, evidence = 1, "wrapper crashed", {}
+    infra = None
+    try:
+        code, reason, evidence = run_agent(prompt, holder,
+                                           [repo_path] if repo_path else [], log_path)
+        infra = detect_infra(evidence, code, repo_path)
+        if infra and infra.hold_until:
+            record_usage_limit(infra.hold_until, task.id)
+    finally:
+        settle_task(task.id, generation, code, reason, infra=infra)
+        holder.finish()
+        lock.release()
+        tl.git_commit(f"tick: {task.id} (generation {generation})")
+    return True
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    tl.RUNTIME.mkdir(parents=True, exist_ok=True)
+    for directory in (RUNS_DIR, WORKERS_DIR, SLOTS_DIR, LOCKS_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    if STOP_FILE.exists():
+        say("STOP file present; loop is paused")
+        return 0
+
+    # Repair before working. Both of these are safe to run while other ticks are
+    # busy: the watchdog only reads, and reclaiming asks each task's own lock
+    # whether anyone is still holding it.
+    watchdog_all()
+    if reclaim_orphans():
+        tl.git_commit("tick: reclaim orphaned tasks")
+    housekeeping()
+
+    # Siblings exist to fill the other slots while this tick is busy with a long
+    # task. With nothing eligible there is nothing for them to fill: they would
+    # start, find the board empty and exit, once per slot per launchd firing.
+    if tl.eligible_tasks():
+        start_siblings()
+
+    # Work task after task for as long as there is work. A tick used to run one
+    # task and exit, so the board sat idle until launchd fired again -- up to
+    # tick_interval_sec of dead air after every task, even with the next task
+    # ready and its repository free. Everything that ends a tick is re-checked
+    # on each pass, so a STOP file, a usage limit or a busy slot still stops it
+    # between tasks rather than in the middle of one.
+    ceiling = int(CONFIG.get("max_tick_wall_sec") or 0)
+    deadline = time.time() + ceiling if ceiling > 0 else None
+    worked = 0
+
+    while True:
+        if STOP_FILE.exists():
+            say(f"STOP file appeared; ending this tick after {worked} task(s)")
+            break
+
+        until = usage_limit_active()
+        if until:
+            local = datetime.fromtimestamp(until).strftime("%H:%M")
+            remaining = int(until - time.time())
+            say(f"usage limit in force; waiting until {local} ({remaining // 60} min left)")
+            break
+
+        reached, spent, ceiling = spend_ceiling_reached()
+        if reached:
+            resumes = datetime.fromtimestamp(next_utc_day()).strftime("%H:%M")
+            say(f"daily spend ceiling reached (${spent:.2f} of ${ceiling:.2f}); "
+                f"no new work until {resumes}")
+            break
+
+        slot = acquire_slot()
+        if slot is None:
+            say(f"all {max(1, int(CONFIG['max_concurrent_tasks']))} slot(s) busy; "
+                f"nothing to start this tick")
+            break
+
+        try:
+            did_work = run_work(next_generation())
+        finally:
+            slot.release()
+
+        if not did_work:
+            break
+        worked += 1
+
+        if deadline is not None and time.time() >= deadline:
+            say(f"tick wall limit reached after {worked} task(s); "
+                f"launchd will start the next one")
+            break
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

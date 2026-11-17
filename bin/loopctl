@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""Install, inspect and brake the unattended loop.
+
+  bin/loopctl doctor      check that this machine can run the loop
+  bin/loopctl install     render the scheduler job for this machine and load it
+  bin/loopctl unit        print the rendered job without installing it
+  bin/loopctl uninstall   unload it
+  bin/loopctl status      is it loaded, is a run in flight, what is it doing
+  bin/loopctl stop        pause the loop (creates the STOP file)
+  bin/loopctl start       release the loop (clears STOP and any plan-limit hold)
+  bin/loopctl run         run one tick right now, in the foreground
+  bin/loopctl logs        tail the loop's output
+
+Nothing here is machine-specific: the label, the paths and the PATH are derived
+at install time, so the same checkout works on any machine it is put on.
+
+This was a bash script for as long as the board was a macOS program. It is
+Python now for the same reason `lib/portable.py` exists - `launchctl` is not the
+only way to fire something on an interval, and a second implementation of
+`doctor` in a second language is a second place for the two to disagree.
+
+    macOS     launchd, a per-user agent in ~/Library/LaunchAgents
+    Linux     systemd, a --user timer in ~/.config/systemd/user
+    Windows   neither, and this says so rather than guessing
+
+Everything that is not the scheduler - `doctor`, `run`, `stop`, `start`,
+`status`, `logs` - works on all three, which is what makes a Windows board
+usable by hand while its loop stays POSIX.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import portable  # noqa: E402
+import tasklib as tl  # noqa: E402
+
+ROOT = tl.ROOT
+TEMPLATES = ROOT / "scheduler"
+STOP_FILE = ROOT / "STOP"
+
+
+# --------------------------------------------------------------------------
+# identity
+# --------------------------------------------------------------------------
+
+def label() -> str:
+    """The scheduler job's name, which identifies the *board* and not the user.
+
+    Two checkouts on one machine - one that runs the loop, one to develop in -
+    would otherwise install under the same name, and installing the second would
+    silently unload the first.
+    """
+    override = os.environ.get("PROJECT_TASKS_LABEL")
+    if override:
+        return override
+    board_id = hashlib.sha1(str(ROOT).encode()).hexdigest()[:6]
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+    return f"com.{user}.project-tasks.{board_id}"
+
+
+def interval() -> int:
+    try:
+        return int(tl.load_config()["tick_interval_sec"])
+    except Exception:
+        return 600
+
+
+def agent_profile() -> dict:
+    try:
+        return tl.agent_profile()
+    except Exception:
+        return {}
+
+
+def render(template: Path) -> str:
+    values = {
+        "LABEL": label(),
+        "ROOT": str(ROOT),
+        "INTERVAL": str(interval()),
+        "PATH": job_path(),
+        "HOME": str(Path.home()),
+        "PYTHON": sys.executable,
+    }
+    text = template.read_text(encoding="utf-8")
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    return text
+
+
+def job_path() -> str:
+    """The PATH the job runs with, which is not the one an interactive shell has.
+
+    A scheduler starts a job with a nearly empty environment, so the agent CLI
+    and the python that is installing this have to be named explicitly. The
+    python matters twice over: on macOS a Full Disk Access grant is given to a
+    *binary*, and a job that finds some other python3 first fails with nothing
+    but "Operation not permitted" on `bin/tick` itself.
+    """
+    parts = []
+    for binary in (sys.executable, shutil.which(str(agent_profile().get("command", [""])[0]) or "")):
+        if binary:
+            directory = str(Path(binary).parent)
+            if directory not in parts:
+                parts.append(directory)
+    parts += ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    seen, ordered = set(), []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            ordered.append(part)
+    return ":".join(ordered)
+
+
+# --------------------------------------------------------------------------
+# schedulers
+# --------------------------------------------------------------------------
+
+class Scheduler:
+    """What every backend has to answer. Nothing above this line is per-OS."""
+
+    name = "none"
+
+    def available(self) -> str | None:
+        """None when this machine can run the loop, else why it cannot."""
+        return f"no unattended scheduler on {portable.platform_name()}"
+
+    def render(self) -> str:
+        raise NotImplementedError
+
+    def install(self) -> None:
+        raise NotImplementedError
+
+    def uninstall(self) -> None:
+        raise NotImplementedError
+
+    def loaded(self) -> bool:
+        return False
+
+    def log_files(self) -> list[Path]:
+        return [tl.RUNTIME / "loop.out.log"]
+
+
+class Launchd(Scheduler):
+    name = "launchd"
+
+    @property
+    def plist(self) -> Path:
+        return Path.home() / "Library" / "LaunchAgents" / f"{label()}.plist"
+
+    def available(self) -> str | None:
+        return None if shutil.which("launchctl") else "launchctl is not on PATH"
+
+    def render(self) -> str:
+        return render(TEMPLATES / "launchd.plist.template")
+
+    @property
+    def log_dir(self) -> Path:
+        # Outside the repository on purpose: launchd's spawn helper opens the
+        # job's log files before the interpreter starts, and macOS refuses that
+        # inside a TCC-protected folder (Documents, Desktop, Downloads) even when
+        # the interpreter has Full Disk Access. Must match the plist template.
+        return Path.home() / "Library" / "Logs" / "project-tasks"
+
+    def install(self) -> None:
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        # launchd does not create a missing directory for StandardOutPath.
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.plist.write_text(self.render(), encoding="utf-8")
+        self.uninstall(quiet=True)
+        run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(self.plist)], check=True)
+        print(f"loaded {label()} (every {interval()}s) from {self.plist}")
+
+    def uninstall(self, quiet: bool = False) -> None:
+        run(["launchctl", "bootout", f"gui/{os.getuid()}/{label()}"])
+        # A job installed before labels carried the board id.
+        legacy = f"com.{os.environ.get('USER', 'user')}.project-tasks"
+        run(["launchctl", "bootout", f"gui/{os.getuid()}/{legacy}"])
+        if not quiet:
+            self.plist.unlink(missing_ok=True)
+            print(f"unloaded {label()}")
+
+    def loaded(self) -> bool:
+        return run(["launchctl", "print", f"gui/{os.getuid()}/{label()}"]).returncode == 0
+
+    def log_files(self) -> list[Path]:
+        return [self.log_dir / f"{label()}.out.log", self.log_dir / f"{label()}.err.log"]
+
+
+class Systemd(Scheduler):
+    name = "systemd"
+
+    @property
+    def unit_dir(self) -> Path:
+        return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+
+    def available(self) -> str | None:
+        if not shutil.which("systemctl"):
+            return "systemctl is not on PATH"
+        if run(["systemctl", "--user", "show-environment"]).returncode != 0:
+            # Common on a server logged into over ssh: without a user manager
+            # there is nothing to install a --user timer into. `loginctl
+            # enable-linger` is the fix, and it is worth naming.
+            return ("no systemd --user manager for this session; "
+                    f"try: loginctl enable-linger {os.environ.get('USER', '$USER')}")
+        return None
+
+    def render(self) -> str:
+        return (f"# --- {label()}.service ---\n"
+                + render(TEMPLATES / "systemd.service.template")
+                + f"\n# --- {label()}.timer ---\n"
+                + render(TEMPLATES / "systemd.timer.template"))
+
+    def install(self) -> None:
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        (self.unit_dir / f"{label()}.service").write_text(
+            render(TEMPLATES / "systemd.service.template"), encoding="utf-8")
+        (self.unit_dir / f"{label()}.timer").write_text(
+            render(TEMPLATES / "systemd.timer.template"), encoding="utf-8")
+        run(["systemctl", "--user", "daemon-reload"], check=True)
+        run(["systemctl", "--user", "enable", "--now", f"{label()}.timer"], check=True)
+        print(f"enabled {label()}.timer (every {interval()}s) from {self.unit_dir}")
+
+    def uninstall(self) -> None:
+        run(["systemctl", "--user", "disable", "--now", f"{label()}.timer"])
+        (self.unit_dir / f"{label()}.timer").unlink(missing_ok=True)
+        (self.unit_dir / f"{label()}.service").unlink(missing_ok=True)
+        run(["systemctl", "--user", "daemon-reload"])
+        print(f"disabled {label()}.timer")
+
+    def loaded(self) -> bool:
+        return run(["systemctl", "--user", "is-enabled", f"{label()}.timer"]).returncode == 0
+
+    def log_files(self) -> list[Path]:
+        return [tl.RUNTIME / "loop.out.log"]
+
+
+def scheduler() -> Scheduler:
+    return {"launchd": Launchd, "systemd": Systemd}.get(portable.scheduler(), Scheduler)()
+
+
+def run(command: list[str], check: bool = False) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        sys.exit(f"error: {' '.join(command)}\n{result.stderr.strip()}")
+    return result
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_doctor(_args) -> int:
+    ok = True
+    sched = scheduler()
+
+    def row(name: str, value: str) -> None:
+        print(f"{name + ':':<14}{value}")
+
+    row("platform", portable.platform_name())
+    row("python3", f"{sys.version.split()[0]} -> {sys.executable}")
+
+    profile = agent_profile()
+    if not profile:
+        row("agent", "MISSING - no agent profile in config.json")
+        ok = False
+    else:
+        binary = profile["command"][0]
+        found = shutil.which(binary)
+        if found:
+            row("agent", f"{profile['name']} -> {found}")
+        else:
+            row("agent", f"MISSING - {binary} is not on PATH (profile: {profile['name']})")
+            ok = False
+
+    git = shutil.which("git")
+    row("git", git or "MISSING")
+    ok = ok and bool(git)
+
+    if tl.is_embedded():
+        row("board", f"embedded in {tl.host_repo()}")
+    elif tl.git_toplevel():
+        row("board", f"standalone at {ROOT}")
+    else:
+        row("board", "no git repository - run: git init && git add -A && git commit -m init")
+        ok = False
+
+    reason = sched.available()
+    if reason is None:
+        row("scheduler", f"{sched.name}, {'loaded' if sched.loaded() else 'not loaded'}")
+    else:
+        # Not a failure of the board. Everything except `install` works, and
+        # saying "MISSING" about a machine that simply is not a Mac or a Linux
+        # box would be reporting a fact as a fault.
+        row("scheduler", f"{sched.name or 'none'} - {reason}")
+    row("label", label())
+    row("interval", f"{interval()}s")
+
+    # Flushed first: the child writes straight to the terminal while our own
+    # prints are still sitting in a pipe buffer, so without this its verdict
+    # arrives above the rows it is a verdict on.
+    sys.stdout.flush()
+    if subprocess.run([sys.executable, str(ROOT / "bin" / "task"), "doctor"]).returncode != 0:
+        ok = False
+    return 0 if ok else 1
+
+
+def require_scheduler() -> Scheduler:
+    sched = scheduler()
+    reason = sched.available()
+    if reason:
+        sys.exit(f"error: cannot install the loop - {reason}\n"
+                 f"Everything else still works: drive the board with bin/task, and\n"
+                 f"run a tick by hand with bin/loopctl run.")
+    return sched
+
+
+def cmd_install(_args) -> int:
+    sched = require_scheduler()
+    if cmd_doctor(None) != 0:
+        print("\nfix the problems above before installing", file=sys.stderr)
+        return 1
+    sched.install()
+    return 0
+
+
+def cmd_unit(_args) -> int:
+    sched = scheduler()
+    reason = sched.available()
+    if reason and sched.name == "none":
+        sys.exit(f"error: {reason}")
+    print(sched.render(), end="")
+    return 0
+
+
+def cmd_uninstall(_args) -> int:
+    scheduler().uninstall()
+    return 0
+
+
+def cmd_stop(_args) -> int:
+    STOP_FILE.write_text(f"{tl.utcnow()} paused by loopctl\n", encoding="utf-8")
+    print("STOP created; the current tick will terminate its agent and exit")
+    return 0
+
+
+def cmd_start(_args) -> int:
+    # Both things that stop the loop are cleared here: the STOP brake and a
+    # plan-limit hold. "Start" means the loop should be working now, and having
+    # to remember which of two commands lifts which brake is a worse interface
+    # than clearing both. A hold that is still real comes straight back.
+    STOP_FILE.unlink(missing_ok=True)
+    (tl.RUNTIME / "usage_limit.json").unlink(missing_ok=True)
+    print("loop released; it claims work again at the next firing")
+    return 0
+
+
+def cmd_run(_args) -> int:
+    return subprocess.run([sys.executable, str(ROOT / "bin" / "tick")]).returncode
+
+
+def live_runs() -> list[str]:
+    """What is in flight, one line per run.
+
+    This used to read `.runtime/worker.json`, a single file from before the
+    board could work several projects at once. Nothing has written that name
+    since, so `status` reported an idle board however many agents were running.
+    """
+    lines = []
+    for path in sorted((tl.RUNTIME / "workers").glob("*.json")):
+        worker = tl.read_json(path, {}) or {}
+        pid = int(worker.get("pid") or 0)
+        if not pid or not portable.process_alive(pid):
+            continue
+        task_id = worker.get("task_id", "?")
+        events = worker.get("events", 0)
+        lines.append(f"pid {pid} on {task_id} ({events} events)")
+    return lines
+
+
+def cmd_status(_args) -> int:
+    sched = scheduler()
+    reason = sched.available()
+    if reason:
+        print(f"{sched.name}: unavailable - {reason}")
+    else:
+        print(f"{sched.name}: {'loaded' if sched.loaded() else 'not loaded'} ({label()})")
+
+    if STOP_FILE.exists():
+        print(f"loop:    PAUSED ({STOP_FILE.read_text(encoding='utf-8').strip()})")
+    else:
+        print("loop:    active")
+
+    runs = live_runs()
+    print("worker:  " + ("idle" if not runs else "\n         ".join(runs)))
+    sys.stdout.flush()
+    subprocess.run([sys.executable, str(ROOT / "bin" / "task"), "doctor"])
+    return 0
+
+
+def cmd_logs(args) -> int:
+    files = [p for p in scheduler().log_files() if p.exists()]
+    if not files:
+        print("no log files yet; the loop writes them on its first firing")
+        if scheduler().name == "systemd":
+            print(f"systemd also keeps its own: journalctl --user -u {label()}.service -f")
+        return 0
+    if not args.follow:
+        for path in files:
+            print(f"--- {path} ---")
+            print("".join(path.read_text(encoding="utf-8", errors="replace")
+                          .splitlines(keepends=True)[-args.lines:]), end="")
+        return 0
+    return subprocess.run(["tail", "-n", str(args.lines), "-f", *[str(p) for p in files]]).returncode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="loopctl", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="\n".join(__doc__.splitlines()[2:12]))
+    sub = parser.add_subparsers(dest="command")
+    for name, handler, helptext in (
+        ("doctor", cmd_doctor, "check that this machine can run the loop"),
+        ("install", cmd_install, "render the scheduler job and load it"),
+        ("unit", cmd_unit, "print the rendered job without installing it"),
+        ("uninstall", cmd_uninstall, "unload it"),
+        ("status", cmd_status, "is it loaded, is a run in flight"),
+        ("stop", cmd_stop, "pause the loop"),
+        ("start", cmd_start, "release the loop"),
+        ("run", cmd_run, "run one tick in the foreground"),
+    ):
+        sub.add_parser(name, help=helptext).set_defaults(handler=handler)
+    # `plist` is what this was called when launchd was the only backend.
+    sub.add_parser("plist", help=argparse.SUPPRESS).set_defaults(handler=cmd_unit)
+    logs = sub.add_parser("logs", help="show the loop's output")
+    logs.add_argument("-n", "--lines", type=int, default=50)
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.set_defaults(handler=cmd_logs)
+
+    args = parser.parse_args()
+    if not getattr(args, "handler", None):
+        return cmd_status(args)
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

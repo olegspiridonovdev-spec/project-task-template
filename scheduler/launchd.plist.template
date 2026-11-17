@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. `bin/loopctl install` renders it into
+  ~/Library/LaunchAgents/<label>.plist with this machine's paths filled in.
+  Do not edit the rendered copy - edit this file and reinstall.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{LABEL}}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>{{ROOT}}/bin/tick</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{ROOT}}</string>
+
+  <!-- launchd will not start a second instance while this one is still
+       running, so a long task simply skips the intervening firings. -->
+  <key>StartInterval</key>
+  <integer>{{INTERVAL}}</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PATH}}</string>
+    <key>HOME</key>
+    <string>{{HOME}}</string>
+  </dict>
+
+  <!-- Outside the repository on purpose: launchd's spawn helper opens these
+       before the interpreter starts, and on macOS it is refused inside a
+       TCC-protected folder (Documents, Desktop, Downloads) even when the
+       interpreter itself has Full Disk Access. -->
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/Library/Logs/project-tasks/{{LABEL}}.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/Library/Logs/project-tasks/{{LABEL}}.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

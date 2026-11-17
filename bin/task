@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""Command line interface for the Project Tasks board.
+
+Every state change goes through this tool so that transitions are validated,
+frontmatter stays consistent and the task log records what happened.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import tasklib as tl  # noqa: E402
+
+
+def task_summary(task: tl.Task) -> dict:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "project": task.project,
+        "status": task.status,
+        "type": task.type,
+        "size": task.size,
+        "due": task.due,
+        "priority": task.priority,
+        "attempts": task.attempts,
+        "max_attempts": task.max_attempts,
+        "refunds": int(task.meta.get("refunds", 0) or 0),
+        "ready_after": task.meta.get("ready_after") or "",
+        "depends_on": task.depends_on,
+        "owner": task.meta.get("owner", "agent"),
+        "tags": task.meta.get("tags") or [],
+        "created": task.meta.get("created"),
+        "updated": task.meta.get("updated"),
+        "checkpoint_at": task.meta.get("checkpoint_at") or "",
+        "last_error": task.meta.get("last_error") or "",
+        "path": str(task.path.relative_to(tl.ROOT)),
+        "project_dir": str(task.project_dir.relative_to(tl.ROOT)),
+    }
+
+
+def require(task_id: str) -> tl.Task:
+    task = tl.find_task(task_id)
+    if task is None:
+        sys.exit(f"error: no task with id {task_id}")
+    return task
+
+
+def report_lint(task: tl.Task, problems: list[str], stream=sys.stdout) -> None:
+    print(f"{task.id}  {len(problems)} problem(s)  {task.title}", file=stream)
+    for problem in problems:
+        print(f"  - {problem}", file=stream)
+
+
+def add_decision(parser) -> None:
+    """`-d` on every transition: required by two of them, accepted by all.
+
+    Accepted everywhere on purpose. A task going to `blocked` or `needs-human`
+    has usually decided something too, and a flag that only exists on the two
+    commands that demand it would make recording that an act of deliberate
+    effort rather than the obvious thing to do.
+    """
+    parser.add_argument("-d", "--decision", default="",
+                        help="one paragraph for the project journal: what changed, "
+                             "why that way, what is left. Required by `done` and `review`.")
+
+
+def guard_ready(task: tl.Task, force: bool) -> None:
+    """Refuse to make a task ready while lint can say why it is not workable.
+
+    Binding here and nowhere else. `ready` is the promise the loop relies on -
+    whatever sits in it, an agent can act on in a fresh session - and this is the
+    only door into it that a person or an agent walks through by choice. The
+    wrapper's own requeue after a failed attempt goes through `Task.move()` in
+    the library instead, and must stay open: a recovery path that lint can shut
+    would strand the task in-progress with nobody able to put it back.
+    """
+    if force:
+        return
+    # `ready` means available to the loop, so work the loop may never take does
+    # not belong in it. Without this the task lands there and simply never moves:
+    # eligible for nobody, in the one queue whose whole meaning is eligibility.
+    reserved = tl.worked_by_hand(task)
+    if reserved:
+        sys.exit(f"error: {task.id} is {reserved}, and `ready` means available to "
+                 f"the loop.\n  Work it yourself where it is, or pass --force if "
+                 f"you meant to put it in the loop's queue anyway.")
+    problems = tl.lint_task(task)
+    if not problems:
+        return
+    report_lint(task, problems, stream=sys.stderr)
+    sys.exit(f"error: {task.id} is not fit to be ready. "
+             f"Fix the above, or pass --force if you mean it.")
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_new(args) -> int:
+    if not args.project:
+        args.project = tl.default_project()
+        if not args.project:
+            names = sorted(tl.project_name(d) for d in tl.iter_project_dirs())
+            sys.exit("error: --project is required when the board has more than one.\n"
+                     "       this board has: " + (", ".join(names) or "none yet - "
+                     "run `task init` (embedded) or `task project-new` (standalone)"))
+    body = ""
+    if args.body_file:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+    elif args.body:
+        body = args.body
+    wanted = "ready" if args.ready else args.status
+    # A task asked into `ready` is written to `backlog` first and promoted after
+    # it passes lint. Refusing outright would throw the body away and leave the
+    # author to retype it; this keeps the work and withholds only the promise.
+    task = tl.create_task(
+        args.project,
+        args.title,
+        body=body,
+        priority=args.priority,
+        status="backlog" if wanted == "ready" else wanted,
+        depends_on=args.after or [],
+        ready_after=args.ready_after,
+        tags=args.tags or [],
+        parent=args.parent,
+        max_attempts=args.max_attempts,
+        owner=args.owner,
+        task_type=args.type,
+        size=args.size,
+        due=args.due,
+    )
+    refused = []
+    if wanted == "ready":
+        refused = [] if args.force else tl.lint_task(task)
+        if not refused:
+            task.move("ready", actor=args.owner)
+    if args.json:
+        summary = task_summary(task)
+        summary["lint"] = refused
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"{task.id}  {task.status}  {task.title}")
+        print(f"  {task.path.relative_to(tl.ROOT)}")
+    if refused:
+        print(f"kept {task.id} in backlog instead of ready:", file=sys.stderr)
+        for problem in refused:
+            print(f"  - {problem}", file=sys.stderr)
+        print("fix the above and run "
+              f"`task ready {task.id}`, or re-create with --force.", file=sys.stderr)
+        task.log("asked for ready, kept in backlog by lint: " + "; ".join(refused),
+                 actor=args.owner)
+        return 2
+    return 0
+
+
+def cmd_list(args) -> int:
+    tasks, index = tl.board_index()
+    rows = []
+    for task in tasks:
+        if args.status and task.status != args.status:
+            continue
+        if args.project and task.project != args.project:
+            continue
+        if not args.all and task.status in ("done", "cancelled") and not args.status:
+            continue
+        summary = task_summary(task)
+        summary["blocked_by"] = tl.blocking_reasons(task, index)
+        rows.append(summary)
+    rows.sort(key=lambda r: (tl.STATUSES.index(r["status"]),
+                             tl.PRIORITY_ORDER.get(r["priority"], 9), r["id"]))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no tasks")
+        return 0
+    width = max(len(r["id"]) for r in rows)
+    for row in rows:
+        flag = " !" if row["blocked_by"] else "  "
+        print(f"{row['id']:<{width}}{flag} {row['status']:<12} {row['priority']} "
+              f"{row['project']:<18} {row['title']}")
+        if args.verbose and row["blocked_by"]:
+            for reason in row["blocked_by"]:
+                print(f"{'':<{width}}      - {reason}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    task = require(args.id)
+    if args.json:
+        print(json.dumps(task_summary(task), indent=2))
+        return 0
+    text = task.path.read_text(encoding="utf-8")
+    entries = task.log_entries()
+    if not args.raw and entries:
+        # The file keeps only the recent entries so an agent's context is not
+        # spent on them; a human asking to see the task still gets one document.
+        meta, body = tl.parse_frontmatter(text)
+        body = tl.set_section(body, "## Log",
+                              tl.render_log(entries, task.log_path.name))
+        text = tl.dump_frontmatter(meta, body)
+    print(text)
+    return 0
+
+
+def cmd_next(args) -> int:
+    task = tl.pick_next()
+    if task is None:
+        if args.json:
+            print(json.dumps({"task": None}))
+        else:
+            print("none")
+        return 1
+    if args.json:
+        print(json.dumps({"task": task_summary(task)}, indent=2))
+    else:
+        print(f"{task.id}  {task.priority}  {task.project}  {task.title}")
+    return 0
+
+
+def cmd_claim(args) -> int:
+    task = require(args.id)
+    if task.status != "ready":
+        sys.exit(f"error: {task.id} is {task.status}, only ready tasks can be claimed")
+    task.meta["attempts"] = task.attempts + 1
+    task.meta["lease_generation"] = args.generation
+    task.move("in-progress", f"claimed by generation {args.generation}", actor="tick")
+    print(f"{task.id} claimed (attempt {task.attempts}/{task.max_attempts})")
+    return 0
+
+
+# Closing a task is the moment its direction is worth a sentence, and the only
+# moment an agent is guaranteed to reach. Asked for at any other point it would
+# be skipped; asked for here, the work cannot be signed off without it.
+JOURNALLED = {"done", "review"}
+
+
+def decision_for(args, task: tl.Task, status: str) -> str | None:
+    """The journal entry this transition must leave behind, or None.
+
+    Checked before the task moves, so a rejected entry costs a retry of the
+    command rather than leaving a task half-transitioned with nothing written.
+    """
+    text = getattr(args, "decision", "") or ""
+    if not text:
+        if status not in JOURNALLED or task.meta.get("journal_at") or getattr(args, "force", False):
+            return None
+        sys.exit(
+            f"error: {task.id} cannot close without a line for the project journal.\n"
+            f"  The next task in {task.project} is worked by an agent that remembers\n"
+            f"  nothing of this one. Say what changed, why that way, and what is left:\n\n"
+            f'    bin/task {status} {task.id} -m "..." \\\n'
+            f'      -d "Retries now back off per destination rather than globally, because\n'
+            f'          one slow endpoint was stalling every other delivery. Dead letters\n'
+            f'          are still dropped - that is the next task."\n\n'
+            f"  Pass --force only if this task genuinely decided nothing.")
+    try:
+        return tl.check_decision(text)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+
+
+def _transition(args, status: str, actor: str = "agent") -> int:
+    task = require(args.id)
+    decision = decision_for(args, task, status)
+    try:
+        task.move(status, args.message, actor=actor, force=getattr(args, "force", False))
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"{task.id} -> {status}")
+    if decision:
+        path = task.record_decision(decision, status)
+        print(f"{task.id} journalled in {path.relative_to(tl.ROOT)}")
+    if status == "needs-human":
+        tl.notify(f"{task.id} needs you", args.message or task.title, "action")
+    elif status == "failed":
+        tl.notify(f"{task.id} failed", args.message or task.title, "error")
+    return 0
+
+
+def cmd_done(args) -> int:
+    return _transition(args, "done")
+
+
+def cmd_review(args) -> int:
+    return _transition(args, "review")
+
+
+def cmd_fail(args) -> int:
+    require(args.id).note_attempt("failed", args.message or "")
+    return _transition(args, "failed")
+
+
+def cmd_block(args) -> int:
+    return _transition(args, "blocked")
+
+
+def cmd_need_human(args) -> int:
+    return _transition(args, "needs-human")
+
+
+def cmd_ready(args) -> int:
+    guard_ready(require(args.id), args.force)
+    return _transition(args, "ready")
+
+
+def cmd_cancel(args) -> int:
+    return _transition(args, "cancelled")
+
+
+def cmd_move(args) -> int:
+    # `move <id> ready` is the same door as `ready <id>`; if it were not guarded
+    # too, the check would be one command away from being routed around.
+    if args.status == "ready":
+        guard_ready(require(args.id), args.force)
+    return _transition(args, args.status)
+
+
+def cmd_log(args) -> int:
+    task = require(args.id)
+    task.log(args.message, actor=args.actor)
+    print(f"{task.id} logged")
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    task = require(args.id)
+    text = args.message
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    task.set_checkpoint(text)
+    task.log("checkpoint saved")
+    print(f"{task.id} checkpoint saved")
+    return 0
+
+
+def cmd_journal(args) -> int:
+    """What a project decided, newest first - the whole file, not the prompt's head."""
+    dirs = []
+    if args.project:
+        found = tl.project_dir_for(args.project)
+        if found is None:
+            sys.exit(f"error: no project named {args.project}")
+        dirs = [found]
+    else:
+        dirs = sorted(tl.iter_project_dirs(), key=lambda d: tl.project_name(d))
+    printed = False
+    for project_dir in dirs:
+        entries = tl.journal_entries(project_dir)
+        if not entries:
+            continue
+        if not args.brief:
+            entries = entries[:args.count] if args.count else entries
+        printed = True
+        print(f"# {tl.project_name(project_dir)}"
+              f"  ({len(tl.journal_entries(project_dir))} entries)\n")
+        if args.brief:
+            print(tl.project_journal(project_dir))
+        else:
+            print("\n\n".join(entries))
+        print()
+    if not printed:
+        print("no journal entries yet")
+    return 0
+
+
+def cmd_projects(args) -> int:
+    rows = []
+    for project_dir in tl.iter_project_dirs():
+        meta = tl.project_meta(project_dir)
+        counts = {}
+        for status in tl.STATUSES:
+            directory = project_dir / "tasks" / status
+            count = len(list(directory.glob("*.md"))) if directory.is_dir() else 0
+            if count:
+                counts[status] = count
+        rows.append({
+            "name": tl.project_name(project_dir),
+            "repo_path": meta.get("repo_path", ""),
+            "prefix": meta.get("prefix", ""),
+            "counts": counts,
+            "repo": tl.repo_state(meta.get("repo_path", "")),
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for row in rows:
+        counts = " ".join(f"{k}={v}" for k, v in row["counts"].items()) or "empty"
+        print(f"{row['name']:<24} {row['prefix']:<6} {counts}")
+        if row["repo_path"]:
+            repo = row["repo"]
+            if not repo["exists"]:
+                state = "MISSING"
+            else:
+                state = repo["branch"]
+                state += f", {repo['dirty']} uncommitted" if repo["dirty"] else ", clean"
+            print(f"{'':<24} repo: {row['repo_path']}  ({state})")
+    return 0
+
+
+def cmd_init(args) -> int:
+    """Turn the directory the board is in into a one-project, embedded board."""
+    if tl.PROJECTS_DIR.is_dir() and any(tl.iter_project_dirs()):
+        existing = sorted(tl.project_name(d) for d in tl.iter_project_dirs())
+        if tl.board_project_dir() is None:
+            sys.exit("error: this board already has projects under projects/, so it is a\n"
+                     f"       standalone board, not an embedded one: {', '.join(existing)}\n"
+                     "       use `task project-new` to add another.")
+    path = tl.init_embedded(prefix=args.prefix, name=args.name)
+    meta = tl.project_meta(path, refresh=True)
+    host = tl.host_repo()
+    print(f"project {meta.get('name')} ({meta.get('prefix')}-001 next)")
+    print(f"  tasks in {path / 'tasks'}")
+    if host:
+        print(f"  working on {host}")
+    else:
+        # Not fatal - a board can be set up before its repository is - but the
+        # loop resolves repo_path to decide which runs may go at once, and until
+        # there is a repository around this board that answer is "the parent
+        # directory", which is a weaker promise than it looks.
+        print("  note: no git repository around this board yet; run `git init` in "
+              f"{tl.ROOT.parent} so the board commits with the code")
+    return 0
+
+
+def cmd_project_new(args) -> int:
+    path = tl.ensure_project(args.name, repo_path=args.repo, prefix=args.prefix)
+    print(f"created {path.relative_to(tl.ROOT)}")
+    return 0
+
+
+def cmd_board(args) -> int:
+    grouped = {status: [] for status, _ in tl.BOARD_COLUMNS}
+    for task in tl.iter_tasks():
+        if task.status in grouped:
+            grouped[task.status].append(task)
+    for status, label in tl.BOARD_COLUMNS:
+        tasks = grouped[status]
+        if status == "done":
+            tasks = tasks[-5:]
+        if not tasks and status in ("failed", "needs-human", "review"):
+            continue
+        print(f"\n{label.upper()}  ({len(grouped[status])})")
+        print("-" * 60)
+        for task in tasks:
+            marker = "*" if task.has_checkpoint() else " "
+            print(f" {marker} {task.id:<10} {task.priority} {task.project:<16} {task.title}")
+    print()
+    return 0
+
+
+def cmd_lint(args) -> int:
+    """Say why a task is not fit to be worked. Non-zero when any is not.
+
+    With no id it lints `ready`, which is the set the loop makes promises about;
+    `--status` widens that to any column, and `--all` to the whole board.
+    """
+    all_tasks, index = tl.board_index()
+    if args.id:
+        tasks = [require(task_id) for task_id in args.id]
+    elif args.all:
+        tasks = [t for t in all_tasks if t.status not in tl.CLOSED]
+    else:
+        tasks = [t for t in all_tasks if t.status == (args.status or "ready")]
+    tasks.sort(key=lambda t: (tl.STATUSES.index(t.status), t.id))
+
+    results = [(task, tl.lint_task(task, index)) for task in tasks]
+    failing = [(task, problems) for task, problems in results if problems]
+
+    if args.json:
+        print(json.dumps([{"id": task.id, "status": task.status,
+                           "title": task.title, "problems": problems}
+                          for task, problems in results], indent=2))
+        return 1 if failing else 0
+
+    if not tasks:
+        print("no tasks to lint")
+        return 0
+    for task, problems in failing:
+        report_lint(task, problems)
+    clean = len(results) - len(failing)
+    print(f"{clean}/{len(results)} task(s) fit to be worked")
+    return 1 if failing else 0
+
+
+def cmd_doctor(args) -> int:
+    """Check invariants that the loop depends on."""
+    problems = []
+    # One walk, then every check reads from it. `doctor` used to resolve each
+    # dependency with `find_task`, which is itself a walk of the board, so the
+    # cost of checking the board grew as the square of its size - and doctor is
+    # exactly the command you reach for when the board is already large.
+    tasks, index = tl.board_index()
+    seen: dict[str, tl.Task] = {}
+    archived = tl.archived_ids()
+    for task in tasks:
+        if task.id in seen:
+            problems.append(f"duplicate id {task.id}: {task.path} and {seen[task.id].path}")
+        seen[task.id] = task
+        if task.meta.get("status") and task.meta["status"] != task.status:
+            problems.append(f"{task.id}: frontmatter says {task.meta['status']}, "
+                            f"directory says {task.status}")
+        for dep in task.depends_on:
+            if dep not in index and dep.upper() not in archived:
+                problems.append(f"{task.id}: unknown dependency {dep}")
+    # A task may be in-progress only while a live holder owns it. Several may be,
+    # one per resource - what would be wrong is one with nobody behind it.
+    workers = tl.live_workers()
+    held = {str(worker.get("task_id")) for worker in workers}
+    running = [t for t in tasks if t.status == "in-progress"]
+    for task in running:
+        if task.id not in held:
+            problems.append(f"{task.id}: in-progress with no live holder (orphan)")
+    by_resource = {}
+    for task in running:
+        by_resource.setdefault(tl.resource_key(task), []).append(task.id)
+    for key, ids in by_resource.items():
+        if len(ids) > 1:
+            problems.append(f"{len(ids)} tasks in-progress on the same resource "
+                            f"({key}): {', '.join(sorted(ids))}")
+    if workers:
+        print(f"note: {len(workers)} run(s) in flight: "
+              + ", ".join(f"{w.get('task_id', '?')} (generation {w.get('generation', '?')})"
+                          for w in workers))
+    for project_dir in tl.iter_project_dirs():
+        configured = tl.project_meta(project_dir).get("repo_path", "")
+        if configured and not tl.repo_state(configured)["exists"]:
+            problems.append(f"{tl.project_name(project_dir)}: repo_path {configured} "
+                            f"is not a git checkout")
+    hold = tl.usage_limit_hold()
+    if hold:
+        print(f"note: plan-limit hold until {hold.get('until_wall', '?')} "
+              f"- no work is claimed until then (bin/loopctl start releases it)")
+    if problems:
+        print("PROBLEMS")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("ok: no invariant violations")
+    return 0
+
+
+def cmd_archive(args) -> int:
+    print(f"archived {tl.archive_closed(args.days)} task(s)")
+    return 0
+
+
+def cmd_index(args) -> int:
+    """Bring `.runtime/index.db` in line with the files, or rebuild it from them.
+
+    Nothing has to run this: every search refreshes the index first. It is here
+    so that "the index is wrong" has an answer that does not require knowing
+    where the file lives, and so a rebuild can be a step in a script.
+    """
+    counts = tl.refresh_index(rebuild=args.rebuild)
+    if args.json:
+        print(json.dumps(counts, indent=2))
+        return 0 if counts["available"] else 1
+    if not counts["available"]:
+        print("index unavailable: " + counts.get("error", "no sqlite3 with FTS5 support"),
+              file=sys.stderr)
+        print("search still works; it reads the files instead", file=sys.stderr)
+        return 1
+    print(f"{counts['total']} document(s) indexed "
+          f"(+{counts['added']} ~{counts['updated']} -{counts['removed']}) "
+          f"in {tl.INDEX_DB.relative_to(tl.ROOT)}")
+    return 0
+
+
+def cmd_search(args) -> int:
+    """Find tasks by words, including ones that have already been archived."""
+    results, used_index = tl.search_tasks(
+        args.query, limit=args.limit,
+        include_archived=not args.no_archived,
+        project=args.project, status=args.status,
+        use_index=not args.no_index, raw=args.raw)
+    if args.json:
+        print(json.dumps({"query": args.query, "used_index": used_index,
+                          "results": results}, indent=2))
+        return 0 if results else 1
+    if not results:
+        print(f"no task matches {args.query!r}")
+        return 1
+    width = max(len(str(r["id"])) for r in results)
+    for row in results:
+        mark = " (archived)" if str(row["archived"]) not in ("0", "") else ""
+        print(f"{str(row['id']):<{width}}  {str(row['status']):<12} "
+              f"{str(row['project']):<18} {row['title']}{mark}")
+        snippet = " ".join(str(row.get("snippet") or "").split())
+        if snippet:
+            print(f"{'':<{width}}    {snippet}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argument parsing
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="task", description="Project Tasks board CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    new = sub.add_parser("new", help="create a task")
+    new.add_argument("--project", help="required only when the board has more than one")
+    new.add_argument("--title", required=True)
+    new.add_argument("--body")
+    new.add_argument("--body-file")
+    new.add_argument("--priority", default="P2", choices=list(tl.PRIORITY_ORDER))
+    new.add_argument("--type", choices=tl.TASK_TYPES, help="what kind of work this is")
+    new.add_argument("--size", choices=tl.TASK_SIZES, help="rough effort")
+    new.add_argument("--due", help="YYYY-MM-DD or an ISO timestamp")
+    new.add_argument("--status", default="backlog", choices=tl.STATUSES)
+    new.add_argument("--ready", action="store_true", help="shortcut for --status ready")
+    new.add_argument("--after", nargs="*", help="task ids this one depends on")
+    new.add_argument("--ready-after", help="ISO timestamp before which it stays unavailable")
+    new.add_argument("--tags", nargs="*")
+    new.add_argument("--parent")
+    new.add_argument("--max-attempts", type=int)
+    new.add_argument("--owner", default="agent", choices=["agent", "human"])
+    new.add_argument("--json", action="store_true")
+    new.add_argument("--force", action="store_true",
+                     help="with --ready, create it ready even if lint objects")
+    new.set_defaults(func=cmd_new)
+
+    listing = sub.add_parser("list", help="list tasks")
+    listing.add_argument("--status", choices=tl.STATUSES)
+    listing.add_argument("--project")
+    listing.add_argument("--all", action="store_true", help="include done and cancelled")
+    listing.add_argument("--verbose", action="store_true")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    show = sub.add_parser("show", help="print a task file")
+    show.add_argument("id")
+    show.add_argument("--json", action="store_true")
+    show.add_argument("--raw", action="store_true",
+                      help="print the file as it is on disk, without the full log")
+    show.set_defaults(func=cmd_show)
+
+    nxt = sub.add_parser("next", help="print the single next eligible task")
+    nxt.add_argument("--json", action="store_true")
+    nxt.set_defaults(func=cmd_next)
+
+    claim = sub.add_parser("claim", help="move a ready task to in-progress (used by bin/tick)")
+    claim.add_argument("id")
+    claim.add_argument("--generation", type=int, required=True)
+    claim.set_defaults(func=cmd_claim)
+
+    for name, func, helptext in [
+        ("done", cmd_done, "mark a task finished"),
+        ("review", cmd_review, "hand a task to human review"),
+        ("fail", cmd_fail, "mark this attempt failed"),
+        ("block", cmd_block, "park a task until something else unblocks it"),
+        ("need-human", cmd_need_human, "escalate to the human"),
+        ("ready", cmd_ready, "make a task available to the loop"),
+        ("cancel", cmd_cancel, "drop a task"),
+    ]:
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("id")
+        sp.add_argument("-m", "--message", default="")
+        add_decision(sp)
+        sp.add_argument("--force", action="store_true",
+                        help="skip transition validation, lint for `ready`, "
+                             "and the journal entry for `done` and `review`")
+        sp.set_defaults(func=func)
+
+    move = sub.add_parser("move", help="generic validated transition")
+    move.add_argument("id")
+    move.add_argument("status", choices=tl.STATUSES)
+    move.add_argument("-m", "--message", default="")
+    add_decision(move)
+    move.add_argument("--force", action="store_true")
+    move.set_defaults(func=cmd_move)
+
+    log = sub.add_parser("log", help="append a line to the task log")
+    log.add_argument("id")
+    log.add_argument("-m", "--message", required=True)
+    log.add_argument("--actor", default="agent")
+    log.set_defaults(func=cmd_log)
+
+    checkpoint = sub.add_parser("checkpoint", help="store resumable state on a task")
+    checkpoint.add_argument("id")
+    checkpoint.add_argument("-m", "--message", default="")
+    checkpoint.add_argument("--file")
+    checkpoint.set_defaults(func=cmd_checkpoint)
+
+    journal = sub.add_parser("journal", help="what a project has decided, newest first")
+    journal.add_argument("project", nargs="?")
+    journal.add_argument("-n", "--count", type=int, default=10,
+                         help="how many entries to print (0 for all)")
+    journal.add_argument("--brief", action="store_true",
+                         help="exactly what an agent prompt is given")
+    journal.set_defaults(func=cmd_journal)
+
+    projects = sub.add_parser("projects", help="list projects")
+    projects.add_argument("--json", action="store_true")
+    projects.set_defaults(func=cmd_projects)
+
+    init = sub.add_parser(
+        "init", help="make this board root its own project (an embedded board)")
+    init.add_argument("--prefix", help="task id prefix; derived from the repository name")
+    init.add_argument("--name", help="project name; defaults to the repository's directory")
+    init.set_defaults(func=cmd_init)
+
+    project_new = sub.add_parser("project-new", help="create a project")
+    project_new.add_argument("name")
+    project_new.add_argument("--repo", help="absolute path to the working repository")
+    project_new.add_argument("--prefix", help="task id prefix, e.g. WH")
+    project_new.set_defaults(func=cmd_project_new)
+
+    board = sub.add_parser("board", help="print an ASCII board")
+    board.set_defaults(func=cmd_board)
+
+    lint = sub.add_parser("lint", help="say why a task is not fit to be worked")
+    lint.add_argument("id", nargs="*", help="task ids; default is everything in ready")
+    lint.add_argument("--status", choices=tl.STATUSES,
+                      help="lint a whole column instead of ready")
+    lint.add_argument("--all", action="store_true", help="lint every open task")
+    lint.add_argument("--json", action="store_true")
+    lint.set_defaults(func=cmd_lint)
+
+    doctor = sub.add_parser("doctor", help="verify board invariants")
+    doctor.set_defaults(func=cmd_doctor)
+
+    archive = sub.add_parser("archive", help="move old done tasks into archive/")
+    archive.add_argument("--days", type=int)
+    archive.set_defaults(func=cmd_archive)
+
+    index = sub.add_parser("index", help="refresh the derived search index")
+    index.add_argument("--rebuild", action="store_true",
+                       help="discard the index and rebuild it from the files")
+    index.add_argument("--json", action="store_true")
+    index.set_defaults(func=cmd_index)
+
+    search = sub.add_parser("search", help="find tasks by words, archive included")
+    search.add_argument("query", help="words to look for; every one must appear")
+    search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--project")
+    search.add_argument("--status", choices=tl.STATUSES)
+    search.add_argument("--no-archived", action="store_true",
+                        help="only tasks still on the board")
+    search.add_argument("--no-index", action="store_true",
+                        help="read the files instead of the index")
+    search.add_argument("--raw", action="store_true",
+                        help="pass the query to FTS5 as written (OR, NEAR, column filters)")
+    search.add_argument("--json", action="store_true")
+    search.set_defaults(func=cmd_search)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
